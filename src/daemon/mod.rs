@@ -35,6 +35,8 @@ use crate::{
 
 mod profiles;
 use self::profiles::{balanced, battery, performance};
+mod fan_dbus;
+use self::fan_dbus::FanDbus;
 
 use system76_power_zbus::ChargeProfile;
 
@@ -531,6 +533,9 @@ pub async fn daemon() -> anyhow::Result<()> {
 
     let daemon = Arc::new(Mutex::new(daemon));
     let mut system76_daemon = System76Power(daemon.clone());
+    // Shared fan override between DBus handler and main loop (std::sync::Mutex)
+    let fan_override_pwm: std::sync::Arc<std::sync::Mutex<Option<u8>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
 
     match system76_daemon.auto_graphics_power().await {
         Ok(()) => (),
@@ -582,6 +587,8 @@ pub async fn daemon() -> anyhow::Result<()> {
         .context("unable to register name")?
         .serve_at(DBUS_PATH, system76_daemon.clone())
         .context("unable to serve")?
+        .serve_at("/com/system76/PowerDaemon/Fan", FanDbus::new(fan_override_pwm.clone()))
+        .context("unable to serve")?
         .build()
         .await
         .context("unable to create system service for com.system76.PowerDaemon")?;
@@ -617,7 +624,18 @@ pub async fn daemon() -> anyhow::Result<()> {
         while CONTINUE.load(Ordering::SeqCst) {
             sleep(Duration::from_millis(1000)).await;
 
-            fan_daemon.step();
+            // Apply override if set; otherwise normal step
+            match fan_override_pwm.lock() {
+                Ok(guard) => {
+                    if let Some(pwm) = *guard {
+                        // Use raw sysfs write to match manual tee behavior
+                        fan_daemon.set_duty_raw_sysfs(pwm);
+                    } else {
+                        fan_daemon.step();
+                    }
+                }
+                Err(_) => fan_daemon.step(),
+            }
 
             // HACK: As of Linux 6.9.3, TBT5 controller must be active for HPD
             // to work on USB-C ports.

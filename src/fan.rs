@@ -146,13 +146,31 @@ impl FanDaemon {
             for platform in &self.platforms {
                 let _ = platform.write_file("pwm1_enable", "1");
                 let _ = platform.write_file("pwm1", &duty_str);
-                let _ = platform.write_file("pwm2", &duty_str);
-                let _ = platform.write_file("pwm3", &duty_str);
-                let _ = platform.write_file("pwm4", &duty_str);
             }
         } else {
             for platform in &self.platforms {
                 let _ = platform.write_file("pwm1_enable", "2");
+            }
+        }
+    }
+
+    /// Set duty by writing directly to sysfs (pwm1 on thelio IO), bypassing helpers
+    /// Intended for persistent override behavior
+    pub fn set_duty_raw_sysfs(&self, duty: u8) {
+        let duty_str = format!("{}", duty);
+        if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name_path = path.join("name");
+                if let Ok(name) = fs::read_to_string(&name_path) {
+                    let name = name.trim();
+                    if name == "system76_thelio_io" || name == "system76_io" {
+                        let enable_path = path.join("pwm1_enable");
+                        let pwm1_path = path.join("pwm1");
+                        let _ = fs::write(&enable_path, b"1");
+                        let _ = fs::write(&pwm1_path, duty_str.as_bytes());
+                    }
+                }
             }
         }
     }
