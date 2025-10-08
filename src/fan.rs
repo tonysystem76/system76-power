@@ -28,6 +28,8 @@ pub struct FanDaemon {
     cpus:              Vec<HwMon>,
     nvidia_exists:     bool,
     displayed_warning: Cell<bool>,
+    // Manual override: when Some(duty), hold this PWM until cleared
+    override_pwm:      Cell<Option<u8>>,
 }
 
 impl FanDaemon {
@@ -47,6 +49,7 @@ impl FanDaemon {
             cpus: Vec::new(),
             nvidia_exists,
             displayed_warning: Cell::new(false),
+            override_pwm: Cell::new(None),
         };
 
         if let Err(err) = daemon.discover() {
@@ -141,13 +144,23 @@ impl FanDaemon {
     /// Set the current duty cycle, from 0 to 255
     /// 0 to 255 is the standard Linux hwmon pwm unit
     pub fn set_duty(&self, duty_opt: Option<u8>) {
+        // If a manual override is active, ignore auto writes entirely
+        if self.override_pwm.get().is_some() && duty_opt.is_none() == false {
+            // Another path is attempting to set a new duty while override is active; ignore
+            return;
+        }
         if let Some(duty) = duty_opt {
+            // Set manual override and write PWM
+            self.override_pwm.set(Some(duty));
             let duty_str = format!("{}", duty);
             for platform in &self.platforms {
+                // Control CPU fan only (pwm1 → fan1 per labels)
                 let _ = platform.write_file("pwm1_enable", "1");
                 let _ = platform.write_file("pwm1", &duty_str);
             }
         } else {
+            // Clear override and return to auto
+            self.override_pwm.set(None);
             for platform in &self.platforms {
                 let _ = platform.write_file("pwm1_enable", "2");
             }
@@ -178,6 +191,17 @@ impl FanDaemon {
     /// Calculate the correct duty cycle and apply it to all fans
     pub fn step(&mut self) {
         if self.discover().is_ok() {
+            // If manual override is active, reapply it directly and skip curve logic
+            if let Some(override_pwm) = self.override_pwm.get() {
+                let duty_str = format!("{}", override_pwm);
+                for platform in &self.platforms {
+                    let _ = platform.write_file("pwm1_enable", "1");
+                    let _ = platform.write_file("pwm1", &duty_str);
+                }
+                return;
+            }
+
+            // Otherwise, follow curve
             self.set_duty(self.get_temp().and_then(|temp| self.get_duty(temp)));
         }
     }

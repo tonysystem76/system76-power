@@ -20,7 +20,6 @@ use tokio::{
     time::sleep,
 };
 use zbus::Interface;
-
 use crate::{
     charge_thresholds::{get_charge_profiles, get_charge_thresholds, set_charge_thresholds},
     errors::ProfileError,
@@ -533,9 +532,6 @@ pub async fn daemon() -> anyhow::Result<()> {
 
     let daemon = Arc::new(Mutex::new(daemon));
     let mut system76_daemon = System76Power(daemon.clone());
-    // Shared fan override between DBus handler and main loop (std::sync::Mutex)
-    let fan_override_pwm: std::sync::Arc<std::sync::Mutex<Option<u8>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
 
     match system76_daemon.auto_graphics_power().await {
         Ok(()) => (),
@@ -581,14 +577,15 @@ pub async fn daemon() -> anyhow::Result<()> {
         .context("unable to create system service for net.hadess.PowerProfiles")?;
 
     // Register DBus interface for com.system76.PowerDaemon.
+    let nvidia_exists = system76_daemon.0.lock().await.graphics.nvidia.len() > 0;
     let connection = zbus::ConnectionBuilder::system()
         .context("failed to create zbus connection builder")?
         .name(DBUS_NAME)
         .context("unable to register name")?
         .serve_at(DBUS_PATH, system76_daemon.clone())
         .context("unable to serve")?
-        .serve_at("/com/system76/PowerDaemon/Fan", FanDbus::new(fan_override_pwm.clone()))
-        .context("unable to serve")?
+        .serve_at("/com/system76/PowerDaemon/Fan", FanDbus::new(nvidia_exists))
+        .context("unable to serve fan iface")?
         .build()
         .await
         .context("unable to create system service for com.system76.PowerDaemon")?;
@@ -624,18 +621,7 @@ pub async fn daemon() -> anyhow::Result<()> {
         while CONTINUE.load(Ordering::SeqCst) {
             sleep(Duration::from_millis(1000)).await;
 
-            // Apply override if set; otherwise normal step
-            match fan_override_pwm.lock() {
-                Ok(guard) => {
-                    if let Some(pwm) = *guard {
-                        // Use raw sysfs write to match manual tee behavior
-                        fan_daemon.set_duty_raw_sysfs(pwm);
-                    } else {
-                        fan_daemon.step();
-                    }
-                }
-                Err(_) => fan_daemon.step(),
-            }
+            fan_daemon.step();
 
             // HACK: As of Linux 6.9.3, TBT5 controller must be active for HPD
             // to work on USB-C ports.
@@ -663,6 +649,8 @@ pub async fn daemon() -> anyhow::Result<()> {
             }
         }
     };
+
+    // Fan DBus interface served via the same connection above
 
     log::info!("Handling dbus requests");
     futures_lite::future::zip(signal_handling_fut, main_loop).await;

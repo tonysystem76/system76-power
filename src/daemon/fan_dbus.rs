@@ -1,37 +1,47 @@
 // Copyright 2025
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::sync::{Arc, Mutex};
 use zbus::dbus_interface;
 
+use crate::fan::FanDaemon;
+
 pub struct FanDbus {
-    // Shared override PWM (0-255). None means auto.
-    override_pwm: Arc<Mutex<Option<u8>>>,
+    // Keep a dedicated FanDaemon instance to perform immediate writes
+    fan: std::sync::Mutex<FanDaemon>,
 }
 
 impl FanDbus {
-    pub fn new(override_pwm: Arc<Mutex<Option<u8>>>) -> Self { Self { override_pwm } }
+    pub fn new(nvidia_exists: bool) -> Self {
+        Self { fan: std::sync::Mutex::new(FanDaemon::new(nvidia_exists)) }
+    }
 }
 
 #[dbus_interface(name = "com.system76.PowerDaemon.Fan")]
 impl FanDbus {
-    /// Set the current duty cycle, from 0 to 255
+    /// 0 to 255 is the standard Linux hwmon pwm unit
     fn set_duty(&self, duty: u8) -> zbus::fdo::Result<()> {
-        if let Ok(mut guard) = self.override_pwm.lock() { *guard = Some(duty); }
+        let fan_opt = self.fan.lock();
+        if let Ok(fan) = fan_opt {
+            fan.set_duty(Some(duty));
+        }
         Ok(())
     }
 
     /// Return to automatic fan control
     fn set_auto(&self) -> zbus::fdo::Result<()> {
-        if let Ok(mut guard) = self.override_pwm.lock() { *guard = None; }
+        let fan_opt = self.fan.lock();
+        if let Ok(fan) = fan_opt {
+            fan.set_duty(None);
+        }
         Ok(())
     }
 
-    /// Set fan to full speed (override)
+    /// Pin CPU fan at controller max speed
     fn full_speed(&self) -> zbus::fdo::Result<()> {
-        if let Ok(mut guard) = self.override_pwm.lock() { *guard = Some(255); }
+        let fan_opt = self.fan.lock();
+        if let Ok(fan) = fan_opt {
+            fan.set_duty(Some(255));
+        }
         Ok(())
     }
 }
-
-// (duplicate block removed)
