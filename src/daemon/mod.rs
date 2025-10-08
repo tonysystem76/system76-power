@@ -578,17 +578,24 @@ pub async fn daemon() -> anyhow::Result<()> {
 
     // Register DBus interface for com.system76.PowerDaemon.
     let nvidia_exists = system76_daemon.0.lock().await.graphics.nvidia.len() > 0;
+    log::info!("Initializing fan DBus interface with nvidia_exists={}", nvidia_exists);
+    
+    let fan_dbus = FanDbus::new(nvidia_exists);
+    log::info!("Created FanDbus instance");
+    
     let connection = zbus::ConnectionBuilder::system()
         .context("failed to create zbus connection builder")?
         .name(DBUS_NAME)
         .context("unable to register name")?
         .serve_at(DBUS_PATH, system76_daemon.clone())
         .context("unable to serve")?
-        .serve_at("/com/system76/PowerDaemon/Fan", FanDbus::new(nvidia_exists))
+        .serve_at("/com/system76/PowerDaemon/Fan", fan_dbus)
         .context("unable to serve fan iface")?
         .build()
         .await
         .context("unable to create system service for com.system76.PowerDaemon")?;
+    
+    log::info!("Successfully registered fan DBus interface at /com/system76/PowerDaemon/Fan");
 
     system76_daemon.0.lock().await.connections =
         Some((connection.clone(), upp_connection, hadess_connection));

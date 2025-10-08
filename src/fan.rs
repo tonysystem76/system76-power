@@ -34,16 +34,34 @@ pub struct FanDaemon {
 
 impl FanDaemon {
     pub fn new(nvidia_exists: bool) -> Self {
+        log::info!("Initializing FanDaemon with nvidia_exists={}", nvidia_exists);
+        
         let model = fs::read_to_string("/sys/class/dmi/id/product_version").unwrap_or_default();
-        let mut daemon = Self {
-            curve: match model.trim() {
-                "thelio-major-r1" => FanCurve::threadripper2(),
-                "thelio-astra-a1" | "thelio-astra-a1.1" | "thelio-major-r2"
-                | "thelio-major-r2.1" | "thelio-major-b1" | "thelio-major-b2"
-                | "thelio-major-b3" | "thelio-mega-r1" | "thelio-mega-r1.1" => FanCurve::hedt(),
-                "thelio-massive-b1" => FanCurve::xeon(),
-                _ => FanCurve::standard(),
+        log::info!("Detected system model: '{}'", model.trim());
+        
+        let curve = match model.trim() {
+            "thelio-major-r1" => {
+                log::info!("Using Threadripper2 fan curve");
+                FanCurve::threadripper2()
             },
+            "thelio-astra-a1" | "thelio-astra-a1.1" | "thelio-major-r2"
+            | "thelio-major-r2.1" | "thelio-major-b1" | "thelio-major-b2"
+            | "thelio-major-b3" | "thelio-mega-r1" | "thelio-mega-r1.1" => {
+                log::info!("Using HEDT fan curve");
+                FanCurve::hedt()
+            },
+            "thelio-massive-b1" => {
+                log::info!("Using Xeon fan curve");
+                FanCurve::xeon()
+            },
+            _ => {
+                log::info!("Using standard fan curve");
+                FanCurve::standard()
+            },
+        };
+        
+        let mut daemon = Self {
+            curve,
             amdgpus: Vec::new(),
             platforms: Vec::new(),
             cpus: Vec::new(),
@@ -52,8 +70,13 @@ impl FanDaemon {
             override_pwm: Cell::new(None),
         };
 
+        log::info!("Discovering hwmon devices...");
         if let Err(err) = daemon.discover() {
-            log::error!("fan daemon: {}", err);
+            log::error!("fan daemon discovery failed: {}", err);
+        } else {
+            log::info!("FanDaemon discovery completed successfully");
+            log::info!("Found {} AMD GPUs, {} platforms, {} CPUs", 
+                      daemon.amdgpus.len(), daemon.platforms.len(), daemon.cpus.len());
         }
 
         daemon
@@ -144,25 +167,43 @@ impl FanDaemon {
     /// Set the current duty cycle, from 0 to 255
     /// 0 to 255 is the standard Linux hwmon pwm unit
     pub fn set_duty(&self, duty_opt: Option<u8>) {
+        log::debug!("FanDaemon::set_duty called with duty_opt={:?}", duty_opt);
+        log::debug!("Current override_pwm: {:?}", self.override_pwm.get());
+        log::debug!("Available platforms: {}", self.platforms.len());
+        
         // If a manual override is active, ignore auto writes entirely
         if self.override_pwm.get().is_some() && duty_opt.is_none() == false {
             // Another path is attempting to set a new duty while override is active; ignore
+            log::debug!("Ignoring set_duty call due to active override");
             return;
         }
         if let Some(duty) = duty_opt {
             // Set manual override and write PWM
+            log::info!("Setting fan duty to {} (manual override)", duty);
             self.override_pwm.set(Some(duty));
             let duty_str = format!("{}", duty);
-            for platform in &self.platforms {
+            for (i, platform) in self.platforms.iter().enumerate() {
                 // Control CPU fan only (pwm1 → fan1 per labels)
-                let _ = platform.write_file("pwm1_enable", "1");
-                let _ = platform.write_file("pwm1", &duty_str);
+                log::debug!("Writing to platform {}: pwm1_enable=1, pwm1={}", i, duty_str);
+                match platform.write_file("pwm1_enable", "1") {
+                    Ok(_) => log::debug!("Successfully set pwm1_enable=1 on platform {}", i),
+                    Err(e) => log::error!("Failed to set pwm1_enable=1 on platform {}: {}", i, e),
+                }
+                match platform.write_file("pwm1", &duty_str) {
+                    Ok(_) => log::debug!("Successfully set pwm1={} on platform {}", duty_str, i),
+                    Err(e) => log::error!("Failed to set pwm1={} on platform {}: {}", duty_str, i, e),
+                }
             }
         } else {
             // Clear override and return to auto
+            log::info!("Clearing fan override, returning to auto mode");
             self.override_pwm.set(None);
-            for platform in &self.platforms {
-                let _ = platform.write_file("pwm1_enable", "2");
+            for (i, platform) in self.platforms.iter().enumerate() {
+                log::debug!("Writing to platform {}: pwm1_enable=2 (auto mode)", i);
+                match platform.write_file("pwm1_enable", "2") {
+                    Ok(_) => log::debug!("Successfully set pwm1_enable=2 on platform {}", i),
+                    Err(e) => log::error!("Failed to set pwm1_enable=2 on platform {}: {}", i, e),
+                }
             }
         }
     }
