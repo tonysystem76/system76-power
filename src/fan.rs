@@ -185,10 +185,19 @@ impl FanDaemon {
             for (i, platform) in self.platforms.iter().enumerate() {
                 // Control CPU fan only (pwm1 → fan1 per labels)
                 log::debug!("Writing to platform {}: pwm1_enable=1, pwm1={}", i, duty_str);
+                
+                // Try to set pwm1_enable, but don't fail if it doesn't exist
                 match platform.write_file("pwm1_enable", "1") {
                     Ok(_) => log::debug!("Successfully set pwm1_enable=1 on platform {}", i),
-                    Err(e) => log::error!("Failed to set pwm1_enable=1 on platform {}: {}", i, e),
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::NotFound {
+                            log::debug!("pwm1_enable not found on platform {} (may not be needed)", i);
+                        } else {
+                            log::error!("Failed to set pwm1_enable=1 on platform {}: {}", i, e);
+                        }
+                    }
                 }
+                
                 match platform.write_file("pwm1", &duty_str) {
                     Ok(_) => log::debug!("Successfully set pwm1={} on platform {}", duty_str, i),
                     Err(e) => log::error!("Failed to set pwm1={} on platform {}: {}", duty_str, i, e),
@@ -200,9 +209,17 @@ impl FanDaemon {
             self.override_pwm.set(None);
             for (i, platform) in self.platforms.iter().enumerate() {
                 log::debug!("Writing to platform {}: pwm1_enable=2 (auto mode)", i);
+                
+                // Try to set pwm1_enable, but don't fail if it doesn't exist
                 match platform.write_file("pwm1_enable", "2") {
                     Ok(_) => log::debug!("Successfully set pwm1_enable=2 on platform {}", i),
-                    Err(e) => log::error!("Failed to set pwm1_enable=2 on platform {}: {}", i, e),
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::NotFound {
+                            log::debug!("pwm1_enable not found on platform {} (may not be needed)", i);
+                        } else {
+                            log::error!("Failed to set pwm1_enable=2 on platform {}: {}", i, e);
+                        }
+                    }
                 }
             }
         }
@@ -221,8 +238,17 @@ impl FanDaemon {
                     if name == "system76_thelio_io" || name == "system76_io" {
                         let enable_path = path.join("pwm1_enable");
                         let pwm1_path = path.join("pwm1");
-                        let _ = fs::write(&enable_path, b"1");
-                        let _ = fs::write(&pwm1_path, duty_str.as_bytes());
+                        
+                        // Try to set pwm1_enable, but don't fail if it doesn't exist
+                        if let Err(e) = fs::write(&enable_path, b"1") {
+                            if e.kind() != io::ErrorKind::NotFound {
+                                log::error!("Failed to write to pwm1_enable: {}", e);
+                            }
+                        }
+                        
+                        if let Err(e) = fs::write(&pwm1_path, duty_str.as_bytes()) {
+                            log::error!("Failed to write to pwm1: {}", e);
+                        }
                     }
                 }
             }
@@ -236,6 +262,7 @@ impl FanDaemon {
             if let Some(override_pwm) = self.override_pwm.get() {
                 let duty_str = format!("{}", override_pwm);
                 for platform in &self.platforms {
+                    // Try to set pwm1_enable, but don't fail if it doesn't exist
                     let _ = platform.write_file("pwm1_enable", "1");
                     let _ = platform.write_file("pwm1", &duty_str);
                 }

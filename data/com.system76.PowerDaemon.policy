@@ -13,4 +13,31 @@
       <allow_active>auth_admin</allow_active>
     </defaults>
   </action>
+  <action id="com.system76.powerdaemon.fan.set-duty">
+    <description>Set fan duty cycle</description>
+    <message>Setting fan speed requires authorization</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+  <action id="com.system76.powerdaemon.fan.set-auto">
+    <description>Set fan to automatic control</description>
+    <message>Setting fan to automatic control requires authorization</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+  <action id="com.system76.powerdaemon.fan.full-speed">
+    <description>Set fan to full speed</description>
+    <message>Setting fan to full speed requires authorization</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
 </policyconfig>
