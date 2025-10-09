@@ -1,17 +1,11 @@
-system76-power (1.2.8+fork2) jammy; urgency=medium
+system76-power (1.2.8) jammy; urgency=medium
 
-  * Add comprehensive logging for fan DBus interface debugging
-  * Fix D-Bus policy to allow access to fan interface
-  * Add detailed error reporting for fan control operations
-  * Improve hardware detection logging
+  * Add support for dracut
+  * Add support for X path used on Fedora
+  * Move NVIDIA power management quirks to system76-driver
+  * Add oryp13
 
- -- Local Builder <builder@localhost>  Mon, 22 Sep 2025 00:00:00 +0000
-
-system76-power (1.2.8+fork1) jammy; urgency=medium
-
-  * Fork build: bump version to ensure local fork is used
-
- -- Local Builder <builder@localhost>  Mon, 22 Sep 2025 00:00:00 +0000
+ -- Tim Crawford <tcrawford@system76.com>  Thu, 18 Sep 2025 09:40:47 -0600
 
 system76-power (1.2.7) jammy; urgency=medium
 

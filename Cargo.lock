@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "system76-power"
-version = "1.2.8+fork2"
+version = "1.2.8"
 dependencies = [
  "anyhow",
  "clap",
