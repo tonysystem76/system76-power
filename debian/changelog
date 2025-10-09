@@ -1,4 +1,4 @@
-system76-power (1.2.8) jammy; urgency=medium
+system76-power (1.2.8-forked) jammy; urgency=medium
 
   * Add support for dracut
   * Add support for X path used on Fedora
