@@ -25,6 +25,9 @@ fn main() {
                 process::exit(1);
             }
 
+            // Log version information
+            log::info!("system76-power-fan-curve daemon starting (version: 1.2.9.1)");
+
             if unsafe { libc::geteuid() } == 0 {
                 daemon::daemon()
             } else {

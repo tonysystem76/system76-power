@@ -1394,8 +1394,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "system76-power"
-version = "1.2.8+fork2"
+name = "system76-power-fan-curve"
+version = "1.2.8+fan-curve-1.0"
 dependencies = [
  "anyhow",
  "clap",

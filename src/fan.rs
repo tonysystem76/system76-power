@@ -184,14 +184,16 @@ impl FanDaemon {
             let duty_str = format!("{}", duty);
             for (i, platform) in self.platforms.iter().enumerate() {
                 // Control CPU fan only (pwm1 → fan1 per labels)
-                log::debug!("Writing to platform {}: pwm1_enable=1, pwm1={}", i, duty_str);
-                match platform.write_file("pwm1_enable", "1") {
-                    Ok(_) => log::debug!("Successfully set pwm1_enable=1 on platform {}", i),
-                    Err(e) => log::error!("Failed to set pwm1_enable=1 on platform {}: {}", i, e),
-                }
+                log::debug!("Writing to platform {}: pwm1={}", i, duty_str);
+                
+                // Write PWM value directly
                 match platform.write_file("pwm1", &duty_str) {
-                    Ok(_) => log::debug!("Successfully set pwm1={} on platform {}", duty_str, i),
-                    Err(e) => log::error!("Failed to set pwm1={} on platform {}: {}", duty_str, i, e),
+                    Ok(_) => {
+                        log::info!("Successfully set pwm1={} on platform {}", duty_str, i);
+                    },
+                    Err(e) => {
+                        log::error!("Failed to set pwm1={} on platform {}: {}", duty_str, i, e);
+                    }
                 }
             }
         } else {
@@ -236,7 +238,6 @@ impl FanDaemon {
             if let Some(override_pwm) = self.override_pwm.get() {
                 let duty_str = format!("{}", override_pwm);
                 for platform in &self.platforms {
-                    let _ = platform.write_file("pwm1_enable", "1");
                     let _ = platform.write_file("pwm1", &duty_str);
                 }
                 return;
@@ -246,7 +247,48 @@ impl FanDaemon {
             self.set_duty(self.get_temp().and_then(|temp| self.get_duty(temp)));
         }
     }
+
+    /// Get the current fan curve points
+    pub fn get_fan_curve(&self) -> Vec<(i16, u16)> {
+        self.curve.points.iter()
+            .map(|point| (point.temp, point.duty))
+            .collect()
+    }
+
+    // Set custom fan curve points
+    pub fn set_fan_curve(&mut self, points: Vec<(i16, u16)>) -> Result<(), FanDaemonError> {
+         // Validate input points
+        if points.is_empty() {
+            return Err(FanDaemonError::PlatformHwmonNotFound); // Reuse existing error type
+        }
+        
+        // Check if points are sorted by temperature
+        for i in 1..points.len() {
+            if points[i-1].0 >= points[i].0 {
+                return Err(FanDaemonError::PlatformHwmonNotFound); // Reuse existing error type
+            }
+        }
+        
+        // Validate duty ranges (0-10000)
+        for (_temp, duty) in &points {
+            if *duty > 10000 {
+                return Err(FanDaemonError::PlatformHwmonNotFound); // Reuse existing error type
+            }
+        }
+        
+        // Create new FanCurve from points
+        let mut new_curve = FanCurve::default();
+        for (temp, duty) in points {
+            new_curve = new_curve.append(temp, duty);
+        }
+        
+        // Replace current curve
+        self.curve = new_curve;
+        
+        Ok(())
+    }
 }
+
 
 impl Drop for FanDaemon {
     fn drop(&mut self) { self.set_duty(None); }
@@ -326,7 +368,7 @@ impl FanCurve {
             .append(88_00, 100_00)
     }
 
-    /// Fan curve for threadripper 2
+    /// Fan curve for threadripper 2 ccc
     pub fn threadripper2() -> Self {
         Self::default()
             .append(00_00, 30_00)

@@ -1,9 +1,12 @@
 [package]
-name = "system76-power"
-version = "1.2.8+fork2"
+name = "system76-power-fan-curve"
+version = "1.2.9.1"
 authors = ["Jeremy Soller <jackpot51@gmail.com>"]
 edition = "2021"
 rust-version = "1.75.0"
+
+[lib]
+name = "system76_power"
 
 [workspace]
 members = [ "zbus" ]
