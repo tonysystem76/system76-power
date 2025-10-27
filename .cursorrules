@@ -1,0 +1,85 @@
+# system76-power-fork Cursor Rules
+
+## Project Context
+- This is a Rust system daemon for fan control and power management
+- Fork of system76-power with enhanced D-Bus fan control capabilities
+- Uses zbus for D-Bus communication
+- Follows system76-power patterns and conventions
+
+## Code Style
+- Use snake_case for variables, functions, and methods
+- Use PascalCase for structs, enums, and traits
+- Use SCREAMING_SNAKE_CASE for constants
+- Always add proper error handling with Result<T, E>
+- Use log::debug/info/warn/error for logging at appropriate levels
+- Include comprehensive documentation comments with ///
+
+## D-Bus Methods
+- Always use zbus::fdo::Result<T> for return types
+- Include proper documentation comments explaining what the method does
+- Handle mutex locks properly with match statements
+- Add logging for method calls: "Fan DBus: method_name called"
+- Add logging for results: "Fan DBus: method_name completed successfully"
+- Handle errors with descriptive messages
+
+## Thread Safety
+- Always acquire mutex locks before accessing shared data
+- Use proper error handling for mutex lock failures
+- Release locks automatically by letting the guard go out of scope
+- Never hold locks longer than necessary
+
+## Fan Control Patterns
+- Temperature values are in thousandths of Celsius (u32)
+- PWM values are 0-255 (u8)
+- Duty values are 0-10000 (u16) for internal calculations
+- Fan speeds are in RPM (u32)
+- Always validate input ranges before processing
+
+## Error Handling
+- Use descriptive error messages
+- Log errors at appropriate levels (error for failures, warn for recoverable issues)
+- Return meaningful D-Bus errors with context
+- Handle file system errors gracefully
+- Validate input parameters
+
+## File System Operations
+- Use std::fs for file operations
+- Handle file not found and permission errors
+- Use proper error propagation with ? operator
+- Log file operations for debugging
+
+## What NOT to do
+- Don't use unsafe code unless absolutely necessary
+- Don't hardcode file paths - use constants or configuration
+- Don't forget to handle errors properly
+- Don't ignore mutex lock failures
+- Don't use unwrap() in production code - use proper error handling
+- Don't forget to add logging for debugging
+- Don't expose internal implementation details in D-Bus interface
+
+## Testing
+- Test D-Bus methods with dbus-send commands
+- Verify methods appear in D-Bus introspection
+- Check that methods return expected data types
+- Test error conditions and edge cases
+
+## D-Bus Method Naming
+- Use PascalCase for D-Bus method names (e.g., GetCurrentTemperature)
+- Use descriptive names that clearly indicate what the method does
+- Follow existing patterns in the codebase
+- Use consistent naming conventions across all methods
+
+## Version Management
+- ALWAYS increment version numbers in Cargo.toml when making commits
+- Use semantic versioning (MAJOR.MINOR.PATCH)
+- Update version in both Cargo.toml and src/main.rs (if applicable)
+- Include version bump in commit message
+- For system76-power-fork: increment patch version for bug fixes, minor for features
+- For Fan-Curve-App: increment patch version for bug fixes, minor for features
+
+## AI Assistant Instructions
+- DO NOT write or modify code unless explicitly asked to do so
+- Only provide code examples when specifically requested
+- Focus on explaining concepts, checking work, and providing guidance
+- Ask for permission before making any code changes
+- When checking work, only analyze and provide feedback, don't modify files

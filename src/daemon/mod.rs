@@ -20,7 +20,6 @@ use tokio::{
     time::sleep,
 };
 use zbus::Interface;
-
 use crate::{
     charge_thresholds::{get_charge_profiles, get_charge_thresholds, set_charge_thresholds},
     errors::ProfileError,
@@ -35,6 +34,8 @@ use crate::{
 
 mod profiles;
 use self::profiles::{balanced, battery, performance};
+mod fan_dbus;
+use self::fan_dbus::FanDbus;
 
 use system76_power_zbus::ChargeProfile;
 
@@ -576,15 +577,26 @@ pub async fn daemon() -> anyhow::Result<()> {
         .context("unable to create system service for net.hadess.PowerProfiles")?;
 
     // Register DBus interface for com.system76.PowerDaemon.
+    let nvidia_exists = system76_daemon.0.lock().await.graphics.nvidia.len() > 0;
+    log::info!("Initializing fan DBus interface with nvidia_exists={}", nvidia_exists);
+    
+    // Create a single shared FanDaemon used by both DBus and the main loop
+    let shared_fan = Arc::new(Mutex::new(FanDaemon::new(nvidia_exists)));
+    log::info!("Created shared FanDaemon instance");
+    
     let connection = zbus::ConnectionBuilder::system()
         .context("failed to create zbus connection builder")?
         .name(DBUS_NAME)
         .context("unable to register name")?
         .serve_at(DBUS_PATH, system76_daemon.clone())
         .context("unable to serve")?
+        .serve_at("/com/system76/PowerDaemon/Fan", FanDbus::new(shared_fan.clone()))
+        .context("unable to serve fan iface")?
         .build()
         .await
         .context("unable to create system service for com.system76.PowerDaemon")?;
+    
+    log::info!("Successfully registered fan DBus interface at /com/system76/PowerDaemon/Fan");
 
     system76_daemon.0.lock().await.connections =
         Some((connection.clone(), upp_connection, hadess_connection));
@@ -600,7 +612,6 @@ pub async fn daemon() -> anyhow::Result<()> {
 
     // Spawn hid backlight daemon
     let _hid_backlight = thread::spawn(hid_backlight::daemon);
-    let mut fan_daemon = FanDaemon::new(nvidia_exists);
     let mut hpd_res = unsafe { HotPlugDetect::new(nvidia_device_id) };
     let mux_res = unsafe { mux::DisplayPortMux::new() };
     let mut hpd = || -> [bool; 4] {
@@ -611,13 +622,18 @@ pub async fn daemon() -> anyhow::Result<()> {
         }
     };
 
+    let shared_fan_for_loop = shared_fan.clone();
     let main_loop = async move {
         let mut last = hpd();
 
         while CONTINUE.load(Ordering::SeqCst) {
             sleep(Duration::from_millis(1000)).await;
 
-            fan_daemon.step();
+            // Step the shared fan daemon
+            {
+                let mut fan = shared_fan_for_loop.lock().await;
+                fan.step();
+            }
 
             // HACK: As of Linux 6.9.3, TBT5 controller must be active for HPD
             // to work on USB-C ports.
@@ -645,6 +661,8 @@ pub async fn daemon() -> anyhow::Result<()> {
             }
         }
     };
+
+    // Fan DBus interface served via the same connection above
 
     log::info!("Handling dbus requests");
     futures_lite::future::zip(signal_handling_fut, main_loop).await;

@@ -1,0 +1,20 @@
+{
+  "folders": [
+    {
+      "path": "..",
+      "name": "system76-power-fork",
+      "uri": "file:///home/system76/system76-power-fork"
+    },
+    {
+      "path": "../Fan-Curve-App",
+      "name": "Fan-Curve-App",
+      "uri": "file:///home/system76/Fan-Curve-App"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/target": true,
+      "**/.git": true
+    }
+  }
+}

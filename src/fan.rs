@@ -28,29 +28,44 @@ pub struct FanDaemon {
     cpus:              Vec<HwMon>,
     nvidia_exists:     bool,
     displayed_warning: Cell<bool>,
+    // Manual override: when Some(duty), hold this PWM until cleared
+    override_pwm:      Cell<Option<u8>>,
 }
 
 impl FanDaemon {
     pub fn new(nvidia_exists: bool) -> Self {
-        let model = fs::read_to_string("/sys/class/dmi/id/product_version").unwrap_or_default();
+        log::info!("Initializing FanDaemon with nvidia_exists={}", nvidia_exists);
+        
+        // Load fan curve from config file
+        let curve = match FanCurve::from_config_file() {
+            Ok(c) => {
+                log::info!("Successfully loaded fan curve from config file");
+                c
+            }
+            Err(e) => {
+                log::warn!("Failed to load fan curve from config: {}", e);
+                log::info!("Using empty default fan curve");
+                FanCurve::default()
+            }
+        };
+        
         let mut daemon = Self {
-            curve: match model.trim() {
-                "thelio-major-r1" => FanCurve::threadripper2(),
-                "thelio-astra-a1" | "thelio-astra-a1.1" | "thelio-major-r2"
-                | "thelio-major-r2.1" | "thelio-major-b1" | "thelio-major-b2"
-                | "thelio-major-b3" | "thelio-mega-r1" | "thelio-mega-r1.1" => FanCurve::hedt(),
-                "thelio-massive-b1" => FanCurve::xeon(),
-                _ => FanCurve::standard(),
-            },
+            curve,
             amdgpus: Vec::new(),
             platforms: Vec::new(),
             cpus: Vec::new(),
             nvidia_exists,
             displayed_warning: Cell::new(false),
+            override_pwm: Cell::new(None),
         };
 
+        log::info!("Discovering hwmon devices...");
         if let Err(err) = daemon.discover() {
-            log::error!("fan daemon: {}", err);
+            log::error!("fan daemon discovery failed: {}", err);
+        } else {
+            log::info!("FanDaemon discovery completed successfully");
+            log::info!("Found {} AMD GPUs, {} platforms, {} CPUs", 
+                      daemon.amdgpus.len(), daemon.platforms.len(), daemon.cpus.len());
         }
 
         daemon
@@ -141,25 +156,122 @@ impl FanDaemon {
     /// Set the current duty cycle, from 0 to 255
     /// 0 to 255 is the standard Linux hwmon pwm unit
     pub fn set_duty(&self, duty_opt: Option<u8>) {
+        log::info!("FanDaemon::set_duty called with duty_opt={:?}", duty_opt);
+        log::info!("Current override_pwm: {:?}", self.override_pwm.get());
+        log::info!("Available platforms: {}", self.platforms.len());
+        
+        // Allow DBus/manual calls to update the override even if one is already active.
+        // Only automatic curve logic should be skipped when an override exists (handled in step()).
         if let Some(duty) = duty_opt {
+            // Set manual override and write PWM
+            log::info!("Setting fan duty to {} (manual override)", duty);
+            log::info!("Number of platforms available: {}", self.platforms.len());
+            log::info!("Setting override_pwm to: {}", duty);
+            self.override_pwm.set(Some(duty));
+            log::info!("override_pwm after set: {:?}", self.override_pwm.get());
             let duty_str = format!("{}", duty);
-            for platform in &self.platforms {
-                let _ = platform.write_file("pwm1_enable", "1");
-                let _ = platform.write_file("pwm1", &duty_str);
-                let _ = platform.write_file("pwm2", &duty_str);
-                let _ = platform.write_file("pwm3", &duty_str);
-                let _ = platform.write_file("pwm4", &duty_str);
+            for (i, platform) in self.platforms.iter().enumerate() {
+                // Control CPU fan only (pwm1 → fan1 per labels)
+                log::info!("Writing to platform {}: pwm1_enable=1, pwm1={}", i, duty_str);
+                log::info!("Platform {} path: {:?}", i, platform.path());
+                
+                // Try to set pwm1_enable, but don't fail if it doesn't exist
+                match platform.write_file("pwm1_enable", "1") {
+                    Ok(_) => log::info!("Successfully set pwm1_enable=1 on platform {}", i),
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::NotFound {
+                            log::info!("pwm1_enable not found on platform {} (may not be needed)", i);
+                        } else {
+                            log::error!("Failed to set pwm1_enable=1 on platform {}: {}", i, e);
+                        }
+                    }
+                }
+                
+                match platform.write_file("pwm1", &duty_str) {
+                    Ok(_) => {
+                        log::info!("Successfully set pwm1={} on platform {}", duty_str, i);
+                        // Verify the write actually worked by reading it back
+                        match platform.read_file("pwm1") {
+                            Ok(value) => log::info!("Verified PWM value after write: {}", value.trim()),
+                            Err(e) => log::warn!("Could not verify PWM value after write: {}", e),
+                        }
+                    },
+                    Err(e) => log::error!("Failed to set pwm1={} on platform {}: {}", duty_str, i, e),
+                }
             }
         } else {
-            for platform in &self.platforms {
-                let _ = platform.write_file("pwm1_enable", "2");
+            // Clear override and return to auto
+            log::info!("Clearing fan override, returning to auto mode");
+            self.override_pwm.set(None);
+            for (i, platform) in self.platforms.iter().enumerate() {
+                log::debug!("Writing to platform {}: pwm1_enable=2 (auto mode)", i);
+                
+                // Try to set pwm1_enable, but don't fail if it doesn't exist
+                match platform.write_file("pwm1_enable", "2") {
+                    Ok(_) => log::debug!("Successfully set pwm1_enable=2 on platform {}", i),
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::NotFound {
+                            log::debug!("pwm1_enable not found on platform {} (may not be needed)", i);
+                        } else {
+                            log::error!("Failed to set pwm1_enable=2 on platform {}: {}", i, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set duty by writing directly to sysfs (pwm1 on thelio IO), bypassing helpers
+    /// Intended for persistent override behavior
+    pub fn set_duty_raw_sysfs(&self, duty: u8) {
+        let duty_str = format!("{}", duty);
+        if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name_path = path.join("name");
+                if let Ok(name) = fs::read_to_string(&name_path) {
+                    let name = name.trim();
+                    if name == "system76_thelio_io" || name == "system76_io" {
+                        let enable_path = path.join("pwm1_enable");
+                        let pwm1_path = path.join("pwm1");
+                        
+                        // Try to set pwm1_enable, but don't fail if it doesn't exist
+                        if let Err(e) = fs::write(&enable_path, b"1") {
+                            if e.kind() != io::ErrorKind::NotFound {
+                                log::error!("Failed to write to pwm1_enable: {}", e);
+                            }
+                        }
+                        
+                        if let Err(e) = fs::write(&pwm1_path, duty_str.as_bytes()) {
+                            log::error!("Failed to write to pwm1: {}", e);
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Calculate the correct duty cycle and apply it to all fans
     pub fn step(&mut self) {
+        log::info!("FanDaemon::step() called");
+        log::info!("Current override_pwm: {:?}", self.override_pwm.get());
+        
         if self.discover().is_ok() {
+            // If manual override is active, reapply it directly and skip curve logic
+            if let Some(override_pwm) = self.override_pwm.get() {
+                log::info!("Override active: {}, reapplying PWM", override_pwm);
+                let duty_str = format!("{}", override_pwm);
+                for platform in &self.platforms {
+                    // Try to set pwm1_enable, but don't fail if it doesn't exist
+                    let _ = platform.write_file("pwm1_enable", "1");
+                    let _ = platform.write_file("pwm1", &duty_str);
+                }
+                log::info!("Override reapplied, skipping curve logic");
+                return;
+            }
+
+            // Otherwise, follow curve
+            log::info!("No override active, following fan curve");
             self.set_duty(self.get_temp().and_then(|temp| self.get_duty(temp)));
         }
     }
@@ -169,7 +281,7 @@ impl Drop for FanDaemon {
     fn drop(&mut self) { self.set_duty(None); }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FanPoint {
     // Temperature in hundredths of a degree, 10000 = 100C
     temp: i16,
@@ -215,7 +327,7 @@ impl FanPoint {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FanCurve {
     points: Vec<FanPoint>,
 }
@@ -281,6 +393,66 @@ impl FanCurve {
             .append(76_00, 85_00)
             .append(77_00, 90_00)
             .append(78_00, 100_00)
+    }
+
+    /// Load a fan curve from the config file
+    pub fn from_config_file() -> Result<Self, String> {
+        use std::path::PathBuf;
+        
+        let config_path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+            .join(".config")
+            .join("system76-power")
+            .join("fan_curves.json");
+        
+        if !config_path.exists() {
+            log::warn!("Config file not found at {:?}, using empty curve", config_path);
+            return Ok(Self::default());
+        }
+        
+        let config_content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        
+        let config: serde_json::Value = serde_json::from_str(&config_content)
+            .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
+        
+        // Get default curve index
+        let default_index = config.get("default_curve_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        
+        // Get all curves
+        let curves = config.get("curves")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "No curves array in config".to_string())?;
+        
+        if default_index >= curves.len() {
+            return Err(format!("Default curve index {} out of range", default_index));
+        }
+        
+        let curve_json = &curves[default_index];
+        let name = curve_json.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Curve missing name".to_string())?;
+        
+        log::info!("Loading fan curve '{}' from config file", name);
+        
+        let points_json = curve_json.get("points")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "Curve missing points".to_string())?;
+        
+        let mut curve = Self::default();
+        for point_json in points_json {
+            let temp = point_json.get("temp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i16;
+            let duty = point_json.get("duty")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+            
+            curve = curve.append(temp, duty);
+        }
+        
+        Ok(curve)
     }
 
     pub fn get_duty(&self, temp: i16) -> Option<u16> {
