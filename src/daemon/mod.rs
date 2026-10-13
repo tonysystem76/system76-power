@@ -132,6 +132,36 @@ struct FanControl {
 }
 
 impl FanControl {
+    /// Record `sender` as the claimant, unless another process holds the claim.
+    fn claim(&mut self, sender: &str) -> Result<(), &'static str> {
+        if self.claimant.as_deref().is_some_and(|claimant| claimant != sender) {
+            return Err("fan control already claimed");
+        }
+        self.claimant = Some(sender.to_owned());
+        Ok(())
+    }
+
+    /// Release the claim on behalf of `sender`, which must hold it if anyone does.
+    fn release_by(&mut self, sender: &str) -> Result<(), &'static str> {
+        match self.claimant.as_deref() {
+            None => Ok(()),
+            Some(claimant) if claimant != sender => Err("fan control claimed by another process"),
+            Some(_) => {
+                self.release();
+                Ok(())
+            }
+        }
+    }
+
+    /// Release the claim if `name`, which has left the bus, holds it.
+    fn release_if_held_by(&mut self, name: &str) -> bool {
+        if self.claimant.as_deref() != Some(name) {
+            return false;
+        }
+        self.release();
+        true
+    }
+
     /// Drop any claim and return the fans to automatic control.
     fn release(&mut self) {
         self.claimant = None;
@@ -363,26 +393,16 @@ impl System76Power {
         check_fan_control_authorization(&connection, &header).await?;
         let sender = message_sender(&header)?;
 
-        {
-            let mut fan_control = self.1.lock().await;
-            if fan_control.claimant.as_ref().is_some_and(|claimant| claimant != &sender) {
-                return Err(zbus_error_from_display("fan control already claimed"));
-            }
-            fan_control.claimant = Some(sender.clone());
-        }
+        self.1.lock().await.claim(&sender).map_err(zbus_error_from_display)?;
 
         // The sender may have disconnected while polkit was checked, before the
         // NameOwnerChanged watch in the main loop could match it to the claim.
-        let bus_name = zbus::names::BusName::try_from(sender.as_str())
-            .map_err(zbus_error_from_display)?;
+        let bus_name =
+            zbus::names::BusName::try_from(sender.as_str()).map_err(zbus_error_from_display)?;
         let has_owner =
             zbus::fdo::DBusProxy::new(&connection).await?.name_has_owner(bus_name).await?;
-        if !has_owner {
-            let mut fan_control = self.1.lock().await;
-            if fan_control.claimant.as_deref() == Some(sender.as_str()) {
-                log::info!("fan control claimant {} disconnected; releasing", sender);
-                fan_control.release();
-            }
+        if !has_owner && self.1.lock().await.release_if_held_by(&sender) {
+            log::info!("fan control claimant {} disconnected; releasing", sender);
         }
 
         Ok(())
@@ -396,17 +416,7 @@ impl System76Power {
         check_fan_control_authorization(&connection, &header).await?;
         let sender = message_sender(&header)?;
 
-        let mut fan_control = self.1.lock().await;
-        match fan_control.claimant {
-            None => Ok(()),
-            Some(ref claimant) if claimant != &sender => {
-                Err(zbus_error_from_display("fan control claimed by another process"))
-            }
-            Some(_) => {
-                fan_control.release();
-                Ok(())
-            }
-        }
+        self.1.lock().await.release_by(&sender).map_err(zbus_error_from_display)
     }
 
     #[dbus_interface(signal)]
@@ -710,13 +720,11 @@ pub async fn daemon() -> anyhow::Result<()> {
                 _ = interval.tick() => (),
                 Some(signal) = name_owner_changed.next() => {
                     if let Ok(args) = signal.args() {
-                        if args.new_owner().is_none() {
-                            let mut fan_control = loop_fan_control.lock().await;
-                            let name = args.name().as_str();
-                            if fan_control.claimant.as_deref() == Some(name) {
-                                log::info!("fan control claimant {} disconnected; releasing", name);
-                                fan_control.release();
-                            }
+                        let name = args.name().as_str();
+                        if args.new_owner().is_none()
+                            && loop_fan_control.lock().await.release_if_held_by(name)
+                        {
+                            log::info!("fan control claimant {} disconnected; releasing", name);
                         }
                     }
                     continue;
@@ -820,5 +828,46 @@ async fn check_fan_control_authorization(
         Ok(())
     } else {
         Err(zbus_error_from_display("Operation not permitted by Polkit"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fan_control() -> FanControl {
+        FanControl { fan_daemon: FanDaemon::new(false), claimant: None }
+    }
+
+    #[test]
+    fn claim_is_exclusive() {
+        let mut fan_control = fan_control();
+        assert_eq!(fan_control.claim(":1.1"), Ok(()));
+        assert_eq!(fan_control.claim(":1.1"), Ok(()));
+        assert_eq!(fan_control.claim(":1.2"), Err("fan control already claimed"));
+        assert_eq!(fan_control.claimant.as_deref(), Some(":1.1"));
+    }
+
+    #[test]
+    fn only_claimant_may_release() {
+        let mut fan_control = fan_control();
+        assert_eq!(fan_control.release_by(":1.2"), Ok(()));
+        fan_control.claim(":1.1").unwrap();
+        assert_eq!(fan_control.release_by(":1.2"), Err("fan control claimed by another process"));
+        assert_eq!(fan_control.claimant.as_deref(), Some(":1.1"));
+        assert_eq!(fan_control.release_by(":1.1"), Ok(()));
+        assert_eq!(fan_control.claimant, None);
+        assert_eq!(fan_control.claim(":1.2"), Ok(()));
+    }
+
+    #[test]
+    fn departed_claimant_is_released() {
+        let mut fan_control = fan_control();
+        assert!(!fan_control.release_if_held_by(":1.1"));
+        fan_control.claim(":1.1").unwrap();
+        assert!(!fan_control.release_if_held_by(":1.2"));
+        assert_eq!(fan_control.claimant.as_deref(), Some(":1.1"));
+        assert!(fan_control.release_if_held_by(":1.1"));
+        assert_eq!(fan_control.claimant, None);
     }
 }
