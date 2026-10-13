@@ -363,7 +363,16 @@ class Runner:
         moment the daemon overwrites it, and reads the temperature right then,
         so a jumpy CPU temperature can't hide a wrong value.
         Returns (ok, text)."""
-        write_all(self.hwmon, MARK)
+        # Each pwm write is a USB transfer to the fan board, so a daemon tick
+        # can land between our writes of pwm1 and pwm4 and leave a mix of its
+        # values and ours. Only start watching once all four read MARK.
+        for _ in range(5):
+            write_all(self.hwmon, MARK)
+            if all(pwm(self.hwmon, i) in (MARK, None) for i in range(1, 5)):
+                break
+            time.sleep(0.3)
+        else:
+            return False, f"could not set all fans to {MARK} between system76-power ticks"
         recent = []  # (time, temperature) just before the tick
         deadline = time.monotonic() + REVERT_TIMEOUT
         while time.monotonic() < deadline:
