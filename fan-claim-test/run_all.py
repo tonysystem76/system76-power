@@ -13,8 +13,10 @@ import argparse
 import csv
 import datetime
 import hashlib
+import math
 import glob
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -35,6 +37,86 @@ MARK = 255  # value the tests write; far from the idle curve (0 or 76)
 REVERT_TIMEOUT = 3.0  # the curve runs once a second
 HOLD_SECONDS = 15
 CPU_HWMON_NAMES = ("k10temp", "coretemp")
+FIRMWARE_LOAD_SECONDS = 90  # test 12: how long to load the CPU with system76-power stopped
+FIRMWARE_TEMP_LIMIT = 90.0  # test 12: stop the load early at this CPU temperature (C)
+
+# Copy of the fan curves in src/fan.rs: (temperature, duty), both in hundredths
+# (4500 = 45.00 C, 3000 = 30.00%). Keep in sync with FanCurve::standard() etc.
+CURVES = {
+    "standard": [(4499, 0), (4500, 3000), (5500, 3500), (6500, 4000), (7500, 5000),
+                 (7800, 6000), (8100, 7000), (8400, 8000), (8600, 9000), (8800, 10000)],
+    "threadripper2": [(0, 3000), (4000, 4000), (4750, 5000), (5500, 6500), (6250, 8500),
+                      (6625, 10000)],
+    "hedt": [(0, 3000), (5000, 3500), (6000, 4500), (7000, 5500), (7400, 6000), (7600, 7000),
+             (7800, 8000), (8100, 10000)],
+    "xeon": [(0, 4000), (5000, 4000), (5500, 4500), (6000, 5000), (6500, 5500), (7000, 6000),
+             (7200, 6500), (7400, 8000), (7600, 8500), (7700, 9000), (7800, 10000)],
+}
+HEDT_MODELS = ("thelio-astra-a1", "thelio-astra-a1.1", "thelio-major-r2", "thelio-major-r2.1",
+               "thelio-major-b1", "thelio-major-b2", "thelio-major-b3", "thelio-mega-r1",
+               "thelio-mega-r1.1")
+DAEMON_TEMP_HWMON_NAMES = ("apm_xgene", "coretemp", "k10temp", "amdgpu")
+
+
+def curve_for_model():
+    """The curve name FanDaemon::new picks for this machine."""
+    try:
+        with open("/sys/class/dmi/id/product_version") as f:
+            model = f.read().strip()
+    except OSError:
+        model = ""
+    if model == "thelio-major-r1":
+        return "threadripper2"
+    if model in HEDT_MODELS:
+        return "hedt"
+    if model == "thelio-massive-b1":
+        return "xeon"
+    return "standard"
+
+
+def curve_pwm(name, millidegrees):
+    """The pwm value (0-255) FanCurve::get_duty gives at a temperature."""
+    points = CURVES[name]
+    temp = millidegrees // 10
+    if temp < points[0][0]:
+        duty = points[0][1]
+    elif temp > points[-1][0]:
+        duty = points[-1][1]
+    else:
+        duty = points[-1][1]
+        for (t0, d0), (t1, d1) in zip(points, points[1:]):
+            if temp == t1:
+                duty = d1
+                break
+            if temp == t0:
+                duty = d0
+                break
+            if t0 < temp < t1:
+                duty = d0 + math.floor((d1 - d0) / (t1 - t0) * (temp - t0) + 0.5)
+                break
+    return duty * 255 // 10000
+
+
+def daemon_temp():
+    """Highest temperature FanDaemon::get_temp would see, in millidegrees C."""
+    temps = []
+    for name_file in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        with open(name_file) as f:
+            if f.read().strip() in DAEMON_TEMP_HWMON_NAMES:
+                value = read_int(os.path.join(os.path.dirname(name_file), "temp1_input"))
+                if value is not None:
+                    temps.append(value)
+    if NVIDIA_SMI:
+        try:
+            out = run([NVIDIA_SMI, "--query-gpu=temperature.gpu", "--format=csv,noheader"],
+                      timeout=5).stdout
+            temps += [int(line) * 1000 for line in out.split() if line.isdigit()]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return max(temps) if temps else None
+
+
+NVIDIA_SMI = shutil.which("nvidia-smi")
 
 
 # --- small helpers -----------------------------------------------------------
@@ -227,9 +309,53 @@ class Runner:
         self.second_conn = None
         self.procs = []
         self.curve_rpm = None
+        self.curve = curve_for_model()
 
     def reverted(self):
         return pwm(self.hwmon) != MARK
+
+    def curve_tick(self):
+        """Catch one system76-power curve tick and check what it wrote.
+
+        Only valid while nobody holds a claim. Writes MARK, watches for the
+        moment the daemon overwrites it, and reads the temperature right then,
+        so a jumpy CPU temperature can't hide a wrong value.
+        Returns (ok, text)."""
+        write_all(self.hwmon, MARK)
+        recent = []  # (time, temperature) just before the tick
+        deadline = time.monotonic() + REVERT_TIMEOUT
+        while time.monotonic() < deadline:
+            temp = daemon_temp()
+            if temp is not None:
+                recent = [(t, v) for t, v in recent if time.monotonic() - t < 0.15]
+                recent.append((time.monotonic(), temp))
+            if pwm(self.hwmon) != MARK:
+                break
+            time.sleep(0.005)
+        else:
+            hot = recent and curve_pwm(self.curve, recent[-1][1]) == MARK
+            return hot, ("curve is at full speed, so a tick can't be seen" if hot
+                         else f"system76-power did not overwrite {MARK} within {REVERT_TIMEOUT:.0f} s")
+        after = daemon_temp()
+        time.sleep(0.2)  # the daemon writes pwm1 to pwm4 one after another
+        values = [v for v in (pwm(self.hwmon, i) for i in range(1, 5)) if v is not None]
+        temps = [v for _, v in recent] + ([after] if after is not None else [])
+        if not temps:
+            return False, "could not read the CPU temperature"
+        low = curve_pwm(self.curve, min(temps) - 500)
+        high = curve_pwm(self.curve, max(temps) + 500)
+        ok = bool(values) and all(low <= v <= high for v in values)
+        expected = f"{low}" if low == high else f"{low}-{high}"
+        fans = values[0] if len(set(values)) == 1 else "/".join(str(v) for v in values)
+        return ok, f"{max(temps) / 1000:.1f} C -> {expected}, fans {fans}{'' if ok else ' WRONG'}"
+
+    def on_curve(self, ticks=3):
+        """Check that the fans follow system76-power's curve on several ticks.
+        Returns (ok, text)."""
+        checks = [self.curve_tick() for _ in range(ticks)]
+        ok = all(check_ok for check_ok, _ in checks)
+        return ok, (f"'{self.curve}' curve {'matched' if ok else 'did NOT match'} on {ticks} ticks ("
+                    + "; ".join(text for _, text in checks) + ")")
 
     def write_mark(self):
         write_all(self.hwmon, MARK)
@@ -249,8 +375,13 @@ class Runner:
         if elapsed is None:
             return False, (f"pwm1 stayed at {MARK} for {REVERT_TIMEOUT:.0f} s with no claim: "
                            "system76-power is not writing the fans, so the other tests prove nothing")
+        curve_ok, curve_text = self.on_curve()
+        if not curve_ok:
+            return False, (f"system76-power overrode {MARK} after {elapsed:.1f} s, but {curve_text}. "
+                           "This script's copy of the curve doesn't match the daemon, so the "
+                           "curve checks in tests 5-7 and 11 can't be trusted")
         return True, (f"no claim: pwm1 {MARK} -> {pwm(self.hwmon)} after {elapsed:.1f} s "
-                      f"(was {before}); fans on the curve ~{self.curve_rpm} RPM")
+                      f"(was {before}); {curve_text}; fans ~{self.curve_rpm} RPM")
 
     def test_claim_holds(self):
         self.holder_conn = client.connect()
@@ -318,7 +449,8 @@ class Runner:
         elapsed = wait_for(self.reverted, REVERT_TIMEOUT)
         if elapsed is None:
             return False, f"release accepted but fans stayed at {MARK}"
-        return True, f"released: pwm1 {MARK} -> {pwm(self.hwmon)} after {elapsed:.1f} s"
+        curve_ok, curve_text = self.on_curve()
+        return curve_ok, f"released: fans left {MARK} after {elapsed:.1f} s; {curve_text}"
 
     def holder_vanishes(self, how):
         started = time.time()
@@ -338,14 +470,15 @@ class Runner:
             holder.proc.stdin.flush()
             holder.proc.wait(10)
         elapsed = wait_for(self.reverted, REVERT_TIMEOUT)
-        error = claim_then_release()
-        logged = "disconnected; releasing" in journal_since(started)
         if elapsed is None:
             return False, f"fans stayed at {MARK} after the holder went away (stuck claim)"
+        curve_ok, curve_text = self.on_curve()
+        error = claim_then_release()
+        logged = "disconnected; releasing" in journal_since(started)
         if error:
             return False, f"fans reverted but a new claim failed: {error}"
-        return True, (f"curve resumed after {elapsed:.1f} s; new claim accepted; "
-                      f"daemon log {'shows' if logged else 'does NOT show'} 'disconnected; releasing'")
+        return curve_ok, (f"fans left {MARK} after {elapsed:.1f} s; {curve_text}; new claim accepted; "
+                          f"daemon log {'shows' if logged else 'does NOT show'} 'disconnected; releasing'")
 
     def test_killed_holder(self):
         return self.holder_vanishes("kill")
@@ -418,6 +551,7 @@ class Runner:
         start = run(["systemctl", "start", SERVICE], timeout=60)
         ready = wait_for(daemon_has_methods, 20, step=0.5)
         resumed = wait_for(self.reverted, 10)
+        curve_ok, curve_text = self.on_curve() if resumed is not None else (False, "")
         error = claim_then_release() if ready is not None else "daemon did not come back"
         exited_cleanly = "daemon exited from loop" in journal_since(started)
 
@@ -432,6 +566,8 @@ class Runner:
             problems.append("daemon did not restart")
         elif resumed is None:
             problems.append("curve did not resume after restart")
+        elif not curve_ok:
+            problems.append(f"after restart {curve_text}")
         if error:
             problems.append(f"new claim after restart failed: {error}")
         if problems:
@@ -440,7 +576,77 @@ class Runner:
                       f"fans stayed at pwm1={pwm_after_stop} (no automatic mode on this board)")
         return True, (f"stopped in {stop_seconds:.1f} s while claimed "
                       f"({'clean exit logged' if exited_cleanly else 'no exit line in log'}); "
-                      f"{after_stop}; restarted, curve resumed after {resumed:.1f} s, new claim accepted")
+                      f"{after_stop}; restarted, fans left {MARK} after {resumed:.1f} s; "
+                      f"{curve_text}; new claim accepted")
+
+    def test_firmware_fallback(self):
+        """What the fan board does on its own while system76-power is stopped.
+
+        Informational: returns None for the result unless system76-power fails
+        to come back and resume its curve, which is a failure."""
+        stop = run(["systemctl", "stop", SERVICE], timeout=60)
+        if stop.returncode != 0 or service_active():
+            return False, f"could not stop system76-power: {stop.stderr.strip()}"
+        load = []
+        start_temp = peak_temp = daemon_temp()
+        start_rpm = peak_rpm = None
+        reacted_after = reacted_pwm = reacted_temp = None
+        hit_limit = False
+        duration = 0.0
+        try:
+            write_all(self.hwmon, 0)
+            time.sleep(2)  # let the fans settle at 0
+            start_rpm = max((rpm(self.hwmon, i) or 0) for i in range(1, 5))
+            peak_rpm = start_rpm
+            load = [subprocess.Popen([sys.executable, "-c", "while True: pass"])
+                    for _ in range(os.cpu_count() or 4)]
+            self.procs.extend(load)
+            began = time.monotonic()
+            while True:
+                duration = time.monotonic() - began
+                temp = daemon_temp()
+                if temp is not None:
+                    peak_temp = max(peak_temp or 0, temp)
+                fan_pwm = pwm(self.hwmon)
+                fan_rpm = max((rpm(self.hwmon, i) or 0) for i in range(1, 5))
+                peak_rpm = max(peak_rpm, fan_rpm)
+                # "Reacted": the board changed the pwm, or spun a fan up clearly.
+                if reacted_after is None and (fan_pwm not in (0, None) or fan_rpm > start_rpm + 500):
+                    reacted_after, reacted_pwm, reacted_temp = duration, fan_pwm, temp
+                if reacted_after is not None and duration - reacted_after > 10:
+                    break
+                if temp is not None and temp / 1000 >= FIRMWARE_TEMP_LIMIT:
+                    hit_limit = True
+                    break
+                if duration >= FIRMWARE_LOAD_SECONDS:
+                    break
+                time.sleep(0.5)
+        finally:
+            for proc in load:
+                proc.kill()
+            run(["systemctl", "start", SERVICE], timeout=60)
+
+        ready = wait_for(daemon_has_methods, 20, step=0.5)
+        if ready is None:
+            return False, "system76-power did not come back after the test"
+        time.sleep(2)  # a couple of curve ticks
+        curve_ok, curve_text = self.on_curve()
+        if not curve_ok:
+            return False, f"system76-power restarted but {curve_text}"
+
+        def celsius(value):
+            return f"{value / 1000:.0f} C" if value is not None else "? C"
+
+        observed = (f"with system76-power stopped and the fans set to 0, CPU load took the CPU "
+                    f"from {celsius(start_temp)} to {celsius(peak_temp)} over {duration:.0f} s"
+                    + (f" (load stopped at the {FIRMWARE_TEMP_LIMIT:.0f} C limit)" if hit_limit else ""))
+        if reacted_after is None:
+            board = (f"pwm1 stayed 0 and fan RPM peaked at {peak_rpm} (was {start_rpm}): the board "
+                     "has NO fallback of its own; the fans only follow a curve while system76-power runs")
+        else:
+            board = (f"the board raised the fans by itself after {reacted_after:.0f} s at "
+                     f"{celsius(reacted_temp)} (pwm1 {reacted_pwm}, peak {peak_rpm} RPM)")
+        return None, f"{observed}; {board}. After restart: {curve_text}"
 
     def cleanup(self):
         for proc in self.procs:
@@ -502,6 +708,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run every fan control claim test and log the results.")
     parser.add_argument("--skip-restart", action="store_true",
                         help="skip test 11, which stops and restarts system76-power")
+    parser.add_argument("--skip-firmware-check", action="store_true",
+                        help="skip test 12, which stops system76-power and loads the CPU with the fans at 0")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -560,13 +768,16 @@ def main():
         ("Curve keeps running during a D-Bus flood", runner.test_flood),
         ("Non-root user is refused", runner.test_non_root),
         ("Daemon stop/restart while claimed", runner.test_restart),
+        ("Fan board on its own with system76-power stopped (info)", runner.test_firmware_fallback),
     ]
+    skips = {11: "--skip-restart" if args.skip_restart else None,
+             12: "--skip-firmware-check" if args.skip_firmware_check else None}
 
     passed = failed = 0
     try:
         for number, (name, test) in enumerate(tests, start=1):
-            if number == 11 and args.skip_restart:
-                line = f"SKIP  {number:2}  {name}: --skip-restart"
+            if skips.get(number):
+                line = f"SKIP  {number:2}  {name}: {skips[number]}"
                 print(line)
                 summary.append(line)
                 continue
@@ -576,9 +787,11 @@ def main():
                 ok, detail = test()
             except Exception as err:  # keep going; record what broke
                 ok, detail = False, f"error: {err}"
-            passed += ok
-            failed += not ok
-            line = f"{'PASS' if ok else 'FAIL'}  {number:2}  {name}: {detail}"
+            if ok is not None:
+                passed += ok
+                failed += not ok
+            status = "INFO" if ok is None else "PASS" if ok else "FAIL"
+            line = f"{status}  {number:2}  {name}: {detail}"
             print(f"        {line}")
             summary.append(line)
     except KeyboardInterrupt:
