@@ -393,7 +393,20 @@ impl System76Power {
         check_fan_control_authorization(&connection, &header).await?;
         let sender = message_sender(&header)?;
 
+        // TEST BRANCH ONLY (fan-claim-test/run_all.py): widen the window between
+        // polkit and recording the claim so a disconnecting caller can hit it.
+        if let Some(ms) =
+            std::env::var("S76_TEST_CLAIM_DELAY_MS").ok().and_then(|ms| ms.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+
         self.1.lock().await.claim(&sender).map_err(zbus_error_from_display)?;
+
+        // TEST BRANCH ONLY: skip the check below, to show what happens without it.
+        if std::env::var_os("S76_TEST_SKIP_LIVENESS_CHECK").is_some() {
+            return Ok(());
+        }
 
         // The sender may have disconnected while polkit was checked, before the
         // NameOwnerChanged watch in the main loop could match it to the claim.
@@ -600,6 +613,14 @@ pub async fn daemon() -> anyhow::Result<()> {
     PCI_RUNTIME_PM.store(pci_runtime_pm, Ordering::SeqCst);
 
     let daemon = PowerDaemon::new()?;
+
+    // TEST BRANCH ONLY: announce the test hooks so run_all.py can confirm them.
+    if let Ok(ms) = std::env::var("S76_TEST_CLAIM_DELAY_MS") {
+        log::warn!("TEST BUILD: fan control claim delay {} ms", ms);
+    }
+    if std::env::var_os("S76_TEST_SKIP_LIVENESS_CHECK").is_some() {
+        log::warn!("TEST BUILD: fan control claim liveness check disabled");
+    }
 
     let nvidia_exists = !daemon.graphics.nvidia.is_empty();
 

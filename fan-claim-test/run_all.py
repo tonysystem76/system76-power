@@ -43,6 +43,12 @@ WATCHDOG_VALUE = 76  # test 13: a low speed (30%) so a board takeover is obvious
 WATCHDOG_SECONDS = 30  # test 13: how long to watch each part
 WATCHDOG_IDLE_TEMP = 50.0  # test 13: wait for the CPU to cool to this first (C)
 RAMP_RPM = 800  # a fan rising this far above its lowest reading counts as a takeover
+FUZZ_ATTEMPTS = 300  # test 14: claim-and-disconnect attempts
+RACE_DELAY_MS = 2000  # test 15: how long the test build pauses before recording a claim
+DROPIN_DIR = f"/run/systemd/system/{SERVICE}.service.d"
+DROPIN = os.path.join(DROPIN_DIR, "fan-claim-test.conf")  # test-only daemon settings
+LIVENESS_MESSAGE = "disconnected before the claim completed; releasing"
+WATCH_MESSAGE = "disconnected; releasing"
 
 # Copy of the fan curves in src/fan.rs: (temperature, duty), both in hundredths
 # (4500 = 45.00 C, 3000 = 30.00%). Keep in sync with FanCurve::standard() etc.
@@ -218,6 +224,38 @@ def claim_then_release():
         return client.call(conn, "ReleaseFanControl")
     finally:
         conn.close_sync(None)
+
+
+def claim_and_vanish(after_seconds):
+    """Send ClaimFanControl without waiting for the answer, then disconnect
+    after_seconds later. Returns the bus name that made the claim."""
+    conn = client.connect()
+    name = conn.get_unique_name()
+    message = Gio.DBusMessage.new_method_call(
+        client.BUS_NAME, client.OBJECT_PATH, client.INTERFACE, "ClaimFanControl")
+    message.set_flags(Gio.DBusMessageFlags.NO_REPLY_EXPECTED)
+    conn.send_message(message, Gio.DBusSendMessageFlags.NONE)
+    conn.flush_sync(None)
+    if after_seconds > 0:
+        time.sleep(after_seconds)
+    conn.close_sync(None)
+    return name
+
+
+def set_daemon_test_env(env):
+    """Restart system76-power with test-only environment variables (or none).
+    Uses a runtime systemd drop-in, which a reboot also removes."""
+    if env:
+        os.makedirs(DROPIN_DIR, exist_ok=True)
+        with open(DROPIN, "w") as f:
+            f.write("[Service]\n" + "".join(f'Environment="{k}={v}"\n' for k, v in env.items()))
+    elif os.path.exists(DROPIN):
+        os.remove(DROPIN)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "restart", SERVICE], timeout=60)
+    if wait_for(daemon_has_methods, 20, step=0.5) is None:
+        raise RuntimeError("system76-power did not come back after restarting")
+    time.sleep(1)
 
 
 def journal_since(epoch):
@@ -759,6 +797,77 @@ class Runner:
         ])
         return None, f"{parts}. {verdict}{idle_note} After release: {curve_text}"
 
+    def test_race_fuzz(self):
+        """Hit the claim/disconnect race on the unmodified daemon by brute force.
+
+        Sends many claims that disconnect after delays spread across the time a
+        claim takes. PASS if no claim is ever left stuck. Reports which path
+        cleaned up each one; the post-claim liveness check is only reached if a
+        disconnect lands in a window of a few milliseconds."""
+        started = time.time()
+        t = time.monotonic()
+        error = claim_then_release()
+        claim_seconds = time.monotonic() - t
+        if error:
+            return False, f"a normal claim failed: {error}"
+        window = max(claim_seconds * 1.5, 0.02)
+        for attempt in range(FUZZ_ATTEMPTS):
+            claim_and_vanish(window * attempt / FUZZ_ATTEMPTS)
+            if wait_for(lambda: claim_then_release() is None, 2.0, step=0.05) is None:
+                set_daemon_test_env(None)  # clear the stuck claim
+                return False, (f"STUCK CLAIM after attempt {attempt + 1} "
+                               f"(disconnect {window * attempt / FUZZ_ATTEMPTS * 1000:.1f} ms after "
+                               "sending); system76-power was restarted to clear it")
+        log = journal_since(started)
+        liveness = log.count(LIVENESS_MESSAGE)
+        watch = log.count(WATCH_MESSAGE)
+        never = FUZZ_ATTEMPTS - liveness - watch
+        hit = (f"{liveness} caught by the post-claim liveness check" if liveness else
+               "0 reached the post-claim liveness check (the window wasn't hit; test 15 forces it)")
+        return True, (f"{FUZZ_ATTEMPTS} claims that disconnected 0-{window * 1000:.0f} ms after sending "
+                      f"(a claim takes ~{claim_seconds * 1000:.0f} ms): {never} gone before polkit "
+                      f"identified them, {watch} recorded then released by the disconnect watch, {hit}; "
+                      "no stuck claims")
+
+    def test_race_forced(self):
+        """Force the race with the test build's pause, with and without the fix.
+
+        Part 1: the daemon pauses RACE_DELAY_MS between polkit and recording the
+        claim; the caller disconnects during the pause. The liveness check must
+        release it. Part 2 (control): same, with the liveness check disabled;
+        the claim must get stuck, proving the check is what prevents it."""
+        pause = RACE_DELAY_MS / 1000
+        started = time.time()
+        set_daemon_test_env({"S76_TEST_CLAIM_DELAY_MS": RACE_DELAY_MS})
+        if "TEST BUILD: fan control claim delay" not in journal_since(started):
+            set_daemon_test_env(None)
+            return False, ("the installed daemon has no test hooks: build and install from the "
+                           "fan-control-claim-test branch")
+        name = claim_and_vanish(pause / 4)
+        time.sleep(pause + 0.5)
+        caught = f"claimant {name} {LIVENESS_MESSAGE}" in journal_since(started)
+        free_after_fix = wait_for(lambda: claim_then_release() is None, pause * 2 + 2, step=0.25)
+
+        started = time.time()
+        set_daemon_test_env({"S76_TEST_CLAIM_DELAY_MS": RACE_DELAY_MS,
+                             "S76_TEST_SKIP_LIVENESS_CHECK": 1})
+        control_name = claim_and_vanish(pause / 4)
+        time.sleep(pause + 0.5)
+        control_error = claim_then_release()
+        stuck_without_fix = bool(control_error) and "already claimed" in control_error
+
+        set_daemon_test_env(None)
+        curve_ok, curve_text = self.on_curve()
+
+        with_fix = (f"with the fix: {name} disconnected during the {pause:.0f} s pause and was "
+                    + ("released by the liveness check" if caught else "NOT released by the liveness check")
+                    + ("; the next claim succeeded" if free_after_fix is not None else "; the claim stayed STUCK"))
+        without = (f"control without the check: {control_name}'s claim "
+                   + ("stayed stuck (next claim: already claimed), as expected" if stuck_without_fix
+                      else f"did NOT get stuck ({control_error or 'next claim succeeded'})"))
+        ok = caught and free_after_fix is not None and stuck_without_fix and curve_ok
+        return ok, f"{with_fix}; {without}; daemon restarted normally: {curve_text}"
+
     def cleanup(self):
         for proc in self.procs:
             if proc.poll() is None:
@@ -768,6 +877,9 @@ class Runner:
                 client.call(conn, "ReleaseFanControl")
                 conn.close_sync(None)
         self.second_conn = self.holder_conn = None
+        if os.path.exists(DROPIN):
+            print("cleanup: removing the test-only daemon settings")
+            set_daemon_test_env(None)
         if not service_active():
             print("cleanup: starting system76-power again")
             run(["systemctl", "start", SERVICE], timeout=60)
@@ -821,6 +933,8 @@ def main():
                         help="skip test 11, which stops and restarts system76-power")
     parser.add_argument("--skip-firmware-check", action="store_true",
                         help="skip test 12, which stops system76-power and loads the CPU with the fans at 0")
+    parser.add_argument("--skip-race-tests", action="store_true",
+                        help="skip tests 14 and 15, the claim/disconnect race tests")
     parser.add_argument("--skip-watchdog-check", action="store_true",
                         help="skip test 13, which checks whether the fan board takes over when not written to")
     args = parser.parse_args()
@@ -835,6 +949,10 @@ def main():
     results = os.path.join(results_root, stamp)
     os.makedirs(results)
     run_started = time.time()
+
+    if os.path.exists(DROPIN):
+        print("Removing test-only daemon settings left over from an earlier run...")
+        set_daemon_test_env(None)
 
     hwmons = client.fan_hwmons()
     hwmon = hwmons[0] if hwmons else None
@@ -883,10 +1001,14 @@ def main():
         ("Daemon stop/restart while claimed", runner.test_restart),
         ("Fan board on its own with system76-power stopped (info)", runner.test_firmware_fallback),
         ("Fan board watchdog: what triggers the takeover (info)", runner.test_watchdog),
+        ("Claim/disconnect race, brute force", runner.test_race_fuzz),
+        ("Claim/disconnect race, forced with the test build", runner.test_race_forced),
     ]
     skips = {11: "--skip-restart" if args.skip_restart else None,
              12: "--skip-firmware-check" if args.skip_firmware_check else None,
-             13: "--skip-watchdog-check" if args.skip_watchdog_check else None}
+             13: "--skip-watchdog-check" if args.skip_watchdog_check else None,
+             14: "--skip-race-tests" if args.skip_race_tests else None,
+             15: "--skip-race-tests" if args.skip_race_tests else None}
 
     passed = failed = 0
     try:

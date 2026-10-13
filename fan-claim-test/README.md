@@ -1,6 +1,6 @@
 # Testing fan control claim on a Thelio
 
-This branch (`fan-control-claim-test`) is the patch from `fan-control-claim` plus this test folder. The test folder is not part of the upstream PR.
+This branch (`fan-control-claim-test`) is the patch from `fan-control-claim` plus this test folder, plus two **test-only hooks** in the daemon (`S76_TEST_CLAIM_DELAY_MS` and `S76_TEST_SKIP_LIVENESS_CHECK`, see test 15). The hooks do nothing unless those environment variables are set, which only `run_all.py` does, temporarily. Neither the hooks nor the test folder are part of the upstream PR.
 
 ## What the patch does
 
@@ -77,13 +77,14 @@ One command runs every test, decides pass or fail from measurements, and saves t
 sudo python3 fan-claim-test/run_all.py
 ```
 
-It takes about 7 minutes. Don't touch the fans or system76-power while it runs. You'll hear the fans go to full speed and back many times, and in tests 12 and 13 they'll go quiet for a while and may then spin up on their own. All of that is expected.
+It takes about 9 minutes. Don't touch the fans or system76-power while it runs. You'll hear the fans go to full speed and back many times, and in tests 12 and 13 they'll go quiet for a while and may then spin up on their own. All of that is expected.
 
-**What it does:** checks the patched daemon is installed, then runs the 13 tests in the table below. Three of them stop system76-power for a while:
+**What it does:** checks the patched daemon is installed, then runs the 15 tests in the table below. Some of them stop or restart system76-power:
 
 - **Test 11** stops and restarts it while a claim is held. Add `--skip-restart` to leave it out.
 - **Test 12** stops it, sets the fans to 0 and loads the CPU for up to 90 s, to see whether the fan board protects itself with nobody running a curve. The load stops early if the CPU reaches 90 °C. Add `--skip-firmware-check` to leave it out.
 - **Test 13** waits for the CPU to cool, then finds out *why* the board takes over: stops system76-power and sets the fans low once (a), claims the fans and sets them low once (b), and claims and rewrites the same low speed every second (c). Each part watches the fans for 30 s. Add `--skip-watchdog-check` to leave it out.
+- **Test 15** restarts system76-power with the test hooks switched on, twice, then restarts it normally. Tests 14 and 15 can be left out together with `--skip-race-tests`.
 
 **How "back on the curve" is checked:** the script has an exact copy of system76-power's fan curves from `src/fan.rs` (checked to match the Rust code at every temperature from 0 to 110 °C). It picks the curve the daemon uses for this model (`standard` on a Thelio Mira). To check a hand-back, it catches the exact moment system76-power writes the fans, reads the CPU temperature at that instant, and confirms the fans got the curve's value for that temperature. It does this on 3 ticks. Test 1 runs the same check before anything is claimed, which confirms the script's copy of the curve agrees with the daemon on this machine.
 
@@ -115,6 +116,8 @@ These are the files to attach when reporting results. The results folder is igno
 | 11 | Stop/restart while claimed | system76-power stops cleanly, restarts, the fans **follow the curve** and a new claim works. On Thelio Io boards the fans stay at their last speed while it's stopped (no automatic mode); that's expected |
 | 12 | Fan board on its own (INFO) | Not pass/fail: it reports whether the fan board raised the fans by itself while system76-power was stopped. It's marked FAIL only if system76-power doesn't come back and follow its curve afterwards |
 | 13 | Fan board watchdog (INFO) | Not pass/fail: it reports a **VERDICT** on whether the board has a watchdog (takes over when nothing writes the fans for a few seconds) or reacts to temperature. It's marked FAIL only if system76-power doesn't follow its curve afterwards |
+| 14 | Claim/disconnect race, brute force | 300 programs each claim and then disconnect at a slightly different moment, spread across the few milliseconds a claim takes. Passes if no claim is ever left stuck. It also counts which safety net cleaned up each one. The post-claim check is only reached if a disconnect lands in a window of a few milliseconds, so it may report 0 there |
+| 15 | Claim/disconnect race, forced | Uses the test hooks to make system76-power pause for 2 s between checking polkit and recording a claim, and disconnects the caller during the pause. **With the fix:** the log must show `disconnected before the claim completed; releasing` and the next claim must succeed. **Control, with the check switched off:** the claim must get stuck. That proves the check is what prevents it. Then system76-power is restarted normally and must follow its curve |
 
 If a test fails, send `summary.txt` and `daemon.log`.
 
