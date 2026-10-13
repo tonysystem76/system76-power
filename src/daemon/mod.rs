@@ -402,7 +402,10 @@ impl System76Power {
         let has_owner =
             zbus::fdo::DBusProxy::new(&connection).await?.name_has_owner(bus_name).await?;
         if !has_owner && self.1.lock().await.release_if_held_by(&sender) {
-            log::info!("fan control claimant {} disconnected; releasing", sender);
+            log::info!(
+                "fan control claimant {} disconnected before the claim completed; releasing",
+                sender
+            );
         }
 
         Ok(())
