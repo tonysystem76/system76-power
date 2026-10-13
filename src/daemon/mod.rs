@@ -385,6 +385,10 @@ impl System76Power {
         Ok(get_charge_profiles())
     }
 
+    /// Stop the fan curve so the caller can set the fan duty itself, until it
+    /// calls ReleaseFanControl or its bus connection closes. The caller should
+    /// keep writing the duty: Thelio Io boards take over after a few seconds
+    /// without a write.
     async fn claim_fan_control(
         &self,
         #[zbus(header)] header: zbus::MessageHeader<'_>,
@@ -411,6 +415,7 @@ impl System76Power {
         Ok(())
     }
 
+    /// Give fan control back to the fan curve. Only the claimant may release.
     async fn release_fan_control(
         &self,
         #[zbus(header)] header: zbus::MessageHeader<'_>,
