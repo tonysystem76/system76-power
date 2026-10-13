@@ -69,7 +69,63 @@ python3 fan-claim-test/fan_claim_test.py status
 
 You should see one or more fan lines as described above. If it says `no system76_io / system76_thelio_io hwmon found`, this machine's fan board isn't detected and the fan tests can't run.
 
-**6. Open three terminals**, all in the `system76-power` folder:
+## Part 2: Run all the tests (recommended)
+
+One command runs every test, decides pass or fail from measurements, and saves the evidence:
+
+```bash
+sudo python3 fan-claim-test/run_all.py
+```
+
+It takes about 2 minutes. Don't touch the fans or system76-power while it runs. You'll hear the fans go to full speed and back several times, which is expected.
+
+**What it does:** checks the patched daemon is installed, then runs the 11 tests in the table below. Test 11 stops and restarts system76-power. To leave that one out, add `--skip-restart`.
+
+Whatever happens, including a failure or Ctrl+C, it releases any claim and makes sure system76-power is running again before it exits.
+
+**When it finishes** it prints `Result: N passed, N failed` and the folder it saved to, `fan-claim-test/results/<date-time>/`:
+
+| File | What's in it |
+|---|---|
+| `summary.txt` | PASS/FAIL for each test with the measurement behind it, e.g. `pwm1 255 -> 0 after 0.8 s` |
+| `samples.csv` | Every 0.5 s: which test was running, CPU temperature, `pwm1`–`pwm4`, and fan RPM. Open it in a spreadsheet and chart the RPM column to see the fans spin up and down |
+| `daemon.log` | system76-power's log during the run, including `claimant ... disconnected; releasing` lines |
+| `system.txt` | Machine model, kernel, fan board, and the exact git commit tested. Also whether the installed binary matches the one you built |
+
+These are the files to attach when reporting results. The results folder is ignored by git.
+
+| # | Test | Passes when |
+|---|---|---|
+| 1 | Control: no claim | system76-power overwrites a manual 255 within 3 s. If this fails, the other results mean nothing |
+| 2 | Claim holds the fans | All fans stay at 255 for 15 s while claimed, with the CPU fully loaded |
+| 3 | Second program rejected | A second connection's claim gets `already claimed` |
+| 4 | Non-holder can't release | The second connection's release is rejected and the fans stay at 255 |
+| 5 | Release | The fans go back to the curve within 3 s |
+| 6 | Killed holder | After a `kill -9` of the holder, the curve resumes and a new claim works |
+| 7 | Holder exits without releasing | Same as 6, but the holder exits normally |
+| 8 | Instant disconnect | A program that claims and disconnects at once leaves no stuck claim |
+| 9 | D-Bus flood | The curve still overrides a manual 255 within 3 s while thousands of connections open and close |
+| 10 | Non-root refused | Your normal user's claim is refused by polkit |
+| 11 | Stop/restart while claimed | system76-power stops cleanly, restarts, the curve resumes and a new claim works. On Thelio Io boards the fans stay at their last speed while it's stopped (no automatic mode); that's expected |
+
+If a test fails, send `summary.txt` and `daemon.log`.
+
+## Part 3: Put the original system76-power back
+
+When you're done testing:
+
+```bash
+sudo apt install --reinstall system76-power
+sudo systemctl restart com.system76.PowerDaemon
+```
+
+To confirm, the `busctl ... | grep FanControl` command from setup step 4 should now print nothing.
+
+## Appendix: running the tests by hand
+
+Use this only to look into a failure more closely. `run_all.py` already does all of it.
+
+Open three terminals, all in the `system76-power` folder:
 
 - **Terminal A** runs the main test commands.
 - **Terminal B** is for second commands while A is busy.
@@ -79,9 +135,7 @@ You should see one or more fan lines as described above. If it says `no system76
   journalctl -u com.system76.PowerDaemon -f
   ```
 
-## Part 2: The tests
-
-Run them in order. Each one says what to do and what you should see. Write down any result that doesn't match.
+Run the tests in order. Each one says what to do and what you should see. Type or paste **one command at a time**: pasting several lines at once can merge them into one broken command.
 
 ### Test 1: Normal behaviour, before any claim
 
@@ -238,18 +292,7 @@ python3 fan-claim-test/fan_claim_test.py contend
 
 **Expect:** `claim REJECTED: ... Operation not permitted by Polkit`.
 
-## Part 3: Put the original system76-power back
-
-When you're done testing:
-
-```bash
-sudo apt install --reinstall system76-power
-sudo systemctl restart com.system76.PowerDaemon
-```
-
-To confirm, the `busctl ... | grep FanControl` command from setup step 4 should now print nothing.
-
-## Results checklist
+## Manual results checklist
 
 | Test | What it checks | Pass? |
 |---|---|---|
