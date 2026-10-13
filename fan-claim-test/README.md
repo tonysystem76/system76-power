@@ -113,7 +113,7 @@ These are the files to attach when reporting results. The results folder is igno
 | 8 | Instant disconnect | A program that claims and disconnects at once leaves no stuck claim |
 | 9 | D-Bus flood | The curve still overrides a manual 255 within 3 s while thousands of connections open and close |
 | 10 | Non-root refused | Your normal user's claim is refused by polkit |
-| 11 | Stop/restart while claimed | system76-power stops cleanly, restarts, the fans **follow the curve** and a new claim works. On Thelio Io boards the fans stay at their last speed while it's stopped (no automatic mode); that's expected |
+| 11 | Stop/restart while claimed | system76-power stops cleanly, restarts, the fans **follow the curve** and a new claim works. On Thelio Io boards there's no `pwm1_enable`, so the fans keep their last speed right after the stop; the board's own watchdog takes over after about 7 s (see test 13). That's expected |
 | 12 | Fan board on its own (INFO) | Not pass/fail: it reports whether the fan board raised the fans by itself while system76-power was stopped. It's marked FAIL only if system76-power doesn't come back and follow its curve afterwards |
 | 13 | Fan board watchdog (INFO) | Not pass/fail: it reports a **VERDICT** on whether the board has a watchdog (takes over when nothing writes the fans for a few seconds) or reacts to temperature. It's marked FAIL only if system76-power doesn't follow its curve afterwards |
 | 14 | Claim/disconnect race, brute force | 300 programs each claim and then disconnect at a slightly different moment, spread across the few milliseconds a claim takes. Passes if no claim is ever left stuck. It also counts which safety net cleaned up each one. The post-claim check is only reached if a disconnect lands in a window of a few milliseconds, so it may report 0 there |
@@ -263,7 +263,7 @@ sudo systemctl stop com.system76.PowerDaemon
 python3 fan-claim-test/fan_claim_test.py status
 ```
 
-**Expect, on a Thelio Io board (`pwm1_enable=-`):** the stop finishes normally (no hang or error) and the fans **stay at 200**. These boards have no automatic mode to fall back to, so whatever speed was last set stays until something sets a new one. The stock system76-power behaves the same way: when it stops, the fans stay at its last curve speed.
+**Expect, on a Thelio Io board (`pwm1_enable=-`):** the stop finishes normally (no hang or error) and the fans **stay at 200** at first. These boards have no `pwm1_enable` to switch back to automatic, but the board has its own watchdog: about 7 s after the last write it takes over and sets its own fan speed (test 13 in `run_all.py` measures this). The stock system76-power behaves the same way when it stops.
 
 **Expect, on an older `system76_io` board:** `pwm1_enable=2` (the board's firmware takes over).
 

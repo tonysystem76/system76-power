@@ -624,7 +624,7 @@ class Runner:
         if problems:
             return False, "; ".join(problems)
         after_stop = (f"pwm1_enable=2" if enable_after_stop == 2 else
-                      f"fans stayed at pwm1={pwm_after_stop} (no automatic mode on this board)")
+                      f"fans read pwm1={pwm_after_stop} right after the stop (no pwm1_enable on this board; its watchdog takes over after ~7 s, see test 13)")
         return True, (f"stopped in {stop_seconds:.1f} s while claimed "
                       f"({'clean exit logged' if exited_cleanly else 'no exit line in log'}); "
                       f"{after_stop}; restarted, fans left {MARK} after {resumed:.1f} s; "
