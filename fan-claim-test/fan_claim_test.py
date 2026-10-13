@@ -51,14 +51,23 @@ def print_status():
 
 def write_pwm(duty):
     for hwmon in fan_hwmons():
-        with open(os.path.join(hwmon, "pwm1_enable"), "w") as f:
-            f.write("1")
-        for i in range(1, 5):
+        # Thelio Io boards (system76_thelio_io) have no pwm1_enable file.
+        enable = os.path.join(hwmon, "pwm1_enable")
+        if os.path.exists(enable):
             try:
-                with open(os.path.join(hwmon, f"pwm{i}"), "w") as f:
+                with open(enable, "w") as f:
+                    f.write("1")
+            except OSError as err:
+                print(f"  could not write {enable}: {err}")
+        for i in range(1, 5):
+            path = os.path.join(hwmon, f"pwm{i}")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "w") as f:
                     f.write(str(duty))
-            except OSError:
-                pass
+            except OSError as err:
+                print(f"  could not write {path}: {err}")
 
 
 def connect():
@@ -98,7 +107,7 @@ def cmd_hold(args):
 
     if args.pwm is not None:
         write_pwm(args.pwm)
-        print(f"wrote pwm1_enable=1 and pwm1-4={args.pwm}")
+        print(f"set pwm1-4={args.pwm}")
 
     print("holding; press Enter to finish, or kill this pid from another terminal")
     try:
@@ -162,7 +171,7 @@ def main():
     sub.add_parser("status", help="show fan pwm values").set_defaults(func=cmd_status)
 
     hold = sub.add_parser("hold", help="claim on one connection and keep it open")
-    hold.add_argument("--pwm", type=int, help="after claiming, set pwm1_enable=1 and pwm1-4")
+    hold.add_argument("--pwm", type=int, help="after claiming, set pwm1-4 to this (0-255)")
     hold.add_argument("--no-release", action="store_true", help="exit without releasing")
     hold.set_defaults(func=cmd_hold)
 

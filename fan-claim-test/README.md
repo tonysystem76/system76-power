@@ -9,27 +9,27 @@ Normally system76-power rewrites the fan speed every second from its built-in fa
 The patch adds two D-Bus methods:
 
 - **`ClaimFanControl`** tells system76-power to stop writing fan speeds. The program that called it is now "holding the claim" and can set the fans itself.
-- **`ReleaseFanControl`** gives control back. system76-power puts the fans back to automatic and resumes its curve.
+- **`ReleaseFanControl`** gives control back. system76-power resumes its curve within about a second.
 
-The claim is also released automatically if the holding program exits or crashes, or if system76-power itself is stopped. Only one program can hold the claim at a time, and only root (or a user who passes a polkit check) can claim.
+The claim is also released automatically if the holding program exits or crashes. Only one program can hold the claim at a time, and only root (or a user who passes a polkit check) can claim.
 
 ## How to read the fan values
 
 Every command below that shows fan values prints a line like this:
 
 ```
-  /sys/class/hwmon/hwmon5: pwm1_enable=1 pwm1=102 pwm2=102 pwm3=102 pwm4=102
+  /sys/class/hwmon/hwmon5: pwm1_enable=- pwm1=76 pwm2=76 pwm3=76 pwm4=76
 ```
 
-- `pwm1_enable=1` means **manual**: software is setting the speed. When system76-power is running its curve, you'll see `1`.
-- `pwm1_enable=2` means **automatic**: the fan controller's own firmware is in charge. A release sets this, but system76-power resumes its curve within a second and sets it back to `1`. So while system76-power is running, `2` usually flashes by too fast to see. You'll see it stay at `2` only in Test 8, where system76-power is stopped.
-- `pwm1` to `pwm4` are fan speeds from `0` (off) to `255` (full). `200` is about 78%.
+- `pwm1` to `pwm4` are fan speeds from `0` (off) to `255` (full). `76` is 30%, `200` is about 78%.
+- `pwm1_enable` is the fan mode. **Thelio Io boards (`system76_thelio_io`, e.g. Thelio Mira r5) don't have this setting, so it shows `-`.** That's normal. Older `system76_io` boards may show `1` (software sets the speed) or `2` (the board's firmware sets the speed).
+- `hwmon5` is just an example. The number differs between machines.
 
-`hwmon5` is just an example. The number differs between machines.
+**What system76-power's curve does at idle:** below 45 °C it sets the fans to `0`, and from 45 °C it jumps to `76` (30%), rising with temperature. A CPU idling near 45 °C can flip between `0` and `76`. Both are normal curve values.
 
 ## Part 1: Set up (once)
 
-All commands are run from the `system76-power` folder.
+> **Run every command from the `system76-power` folder** (the one you cloned), not from inside `fan-claim-test`. If you do `cd fan-claim-test`, drop the `fan-claim-test/` part from each command, or you'll get `can't open file`.
 
 **1. Install build tools** (skip any you already have):
 
@@ -91,7 +91,7 @@ Run them in order. Each one says what to do and what you should see. Write down 
 python3 fan-claim-test/fan_claim_test.py status
 ```
 
-**Expect:** `pwm1_enable=1` and fan speeds that system76-power picked from its curve. This is the baseline.
+**Expect:** fan speeds that system76-power picked from its curve (often `0` or `76` at idle; see "What system76-power's curve does at idle" above). Run it a few times; the values may change as the temperature moves. This is the baseline.
 
 ### Test 2: A claim stops system76-power from changing the fans
 
@@ -129,7 +129,7 @@ Go back to **Terminal A** and press **Enter**.
 **Expect:**
 
 - `release accepted`.
-- The final status line shows the fans **no longer at 200**: they're back to system76-power's curve speed. That means system76-power took control again.
+- The final status line shows the fans **no longer at 200**: they're back to system76-power's curve speed (at idle that's often `0` or `76`). That means system76-power took control again.
 
 ### Test 5: If the holding program is killed, the claim is released
 
@@ -178,7 +178,7 @@ sudo python3 fan-claim-test/fan_claim_test.py contend
 
 **Expect:** the `contend` command prints `claim accepted; releasing`. If it says `claim REJECTED`, a stuck claim was left behind and the test **fails**. To recover from that, run `sudo systemctl restart com.system76.PowerDaemon`.
 
-### Test 8: Stopping system76-power while claimed puts the fans back to automatic
+### Test 8: Stopping and restarting system76-power while claimed
 
 **Terminal A:**
 
@@ -193,13 +193,19 @@ sudo systemctl stop com.system76.PowerDaemon
 python3 fan-claim-test/fan_claim_test.py status
 ```
 
-**Expect:** `pwm1_enable=2`. Without the patch's fix, it would stay at `1` with the fans stuck at 200.
+**Expect, on a Thelio Io board (`pwm1_enable=-`):** the stop finishes normally (no hang or error) and the fans **stay at 200**. These boards have no automatic mode to fall back to, so whatever speed was last set stays until something sets a new one. The stock system76-power behaves the same way: when it stops, the fans stay at its last curve speed.
 
-Then clean up: press **Ctrl+C** in Terminal A (its release call will fail because the daemon is stopped, which is expected), and start the daemon again:
+**Expect, on an older `system76_io` board:** `pwm1_enable=2` (the board's firmware takes over).
+
+Then press **Ctrl+C** in Terminal A (its release call fails because the daemon is stopped; that's expected), and start the daemon again:
 
 ```bash
 sudo systemctl start com.system76.PowerDaemon
+sleep 3
+python3 fan-claim-test/fan_claim_test.py status
 ```
+
+**Expect:** the fans are back on system76-power's curve (no longer 200), and a new claim works: `sudo python3 fan-claim-test/fan_claim_test.py contend` prints `claim accepted; releasing`.
 
 ### Test 9: Lots of D-Bus traffic doesn't slow the fan curve
 
@@ -254,6 +260,6 @@ To confirm, the `busctl ... | grep FanControl` command from setup step 4 should 
 | 5 | Killed holder releases the claim | |
 | 6 | Holder exiting without release releases the claim | |
 | 7 | Instant disconnect leaves no stuck claim | |
-| 8 | Stopping the daemon returns fans to automatic | |
+| 8 | Daemon stops cleanly while claimed; curve resumes after restart | |
 | 9 | Fan curve keeps running during heavy D-Bus traffic | |
 | 10 | Non-root user is refused | |
