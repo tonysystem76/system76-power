@@ -77,12 +77,13 @@ One command runs every test, decides pass or fail from measurements, and saves t
 sudo python3 fan-claim-test/run_all.py
 ```
 
-It takes about 4 minutes. Don't touch the fans or system76-power while it runs. You'll hear the fans go to full speed and back many times, and in test 12 they'll go silent while the CPU heats up. All of that is expected.
+It takes about 7 minutes. Don't touch the fans or system76-power while it runs. You'll hear the fans go to full speed and back many times, and in tests 12 and 13 they'll go quiet for a while and may then spin up on their own. All of that is expected.
 
-**What it does:** checks the patched daemon is installed, then runs the 12 tests in the table below. Two of them stop system76-power for a while:
+**What it does:** checks the patched daemon is installed, then runs the 13 tests in the table below. Three of them stop system76-power for a while:
 
 - **Test 11** stops and restarts it while a claim is held. Add `--skip-restart` to leave it out.
 - **Test 12** stops it, sets the fans to 0 and loads the CPU for up to 90 s, to see whether the fan board protects itself with nobody running a curve. The load stops early if the CPU reaches 90 °C. Add `--skip-firmware-check` to leave it out.
+- **Test 13** waits for the CPU to cool, then finds out *why* the board takes over: stops system76-power and sets the fans low once (a), claims the fans and sets them low once (b), and claims and rewrites the same low speed every second (c). Each part watches the fans for 30 s. Add `--skip-watchdog-check` to leave it out.
 
 **How "back on the curve" is checked:** the script has an exact copy of system76-power's fan curves from `src/fan.rs` (checked to match the Rust code at every temperature from 0 to 110 °C). It picks the curve the daemon uses for this model (`standard` on a Thelio Mira). To check a hand-back, it catches the exact moment system76-power writes the fans, reads the CPU temperature at that instant, and confirms the fans got the curve's value for that temperature. It does this on 3 ticks. Test 1 runs the same check before anything is claimed, which confirms the script's copy of the curve agrees with the daemon on this machine.
 
@@ -113,10 +114,14 @@ These are the files to attach when reporting results. The results folder is igno
 | 10 | Non-root refused | Your normal user's claim is refused by polkit |
 | 11 | Stop/restart while claimed | system76-power stops cleanly, restarts, the fans **follow the curve** and a new claim works. On Thelio Io boards the fans stay at their last speed while it's stopped (no automatic mode); that's expected |
 | 12 | Fan board on its own (INFO) | Not pass/fail: it reports whether the fan board raised the fans by itself while system76-power was stopped. It's marked FAIL only if system76-power doesn't come back and follow its curve afterwards |
+| 13 | Fan board watchdog (INFO) | Not pass/fail: it reports a **VERDICT** on whether the board has a watchdog (takes over when nothing writes the fans for a few seconds) or reacts to temperature. It's marked FAIL only if system76-power doesn't follow its curve afterwards |
 
 If a test fails, send `summary.txt` and `daemon.log`.
 
-**Reading test 12:** "the board has NO fallback of its own" means that when system76-power isn't running, nothing adjusts the fans. They stay at whatever speed was last set until system76-power starts again. That's how the board works with or without this patch, but it's worth knowing: system76-power must be running for the default curve to apply.
+**Reading tests 12 and 13:** system76-power's default curve only runs while system76-power is running. Test 12 shows whether the fan board protects the machine on its own when nothing is running a curve (on the Thelio Mira r5 it ramped the fans to full speed). Test 13 shows what triggers that:
+
+- **Watchdog:** the board takes over when nothing has written the fans for a few seconds. Then any program holding the claim must keep writing the fan speed regularly, as system76-power does every second. If it writes once and stops, the board overrides it.
+- **No watchdog:** the board only reacts to heat, and a single write stays in place.
 
 ## Part 3: Put the original system76-power back
 

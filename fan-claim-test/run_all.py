@@ -39,6 +39,10 @@ HOLD_SECONDS = 15
 CPU_HWMON_NAMES = ("k10temp", "coretemp")
 FIRMWARE_LOAD_SECONDS = 90  # test 12: how long to load the CPU with system76-power stopped
 FIRMWARE_TEMP_LIMIT = 90.0  # test 12: stop the load early at this CPU temperature (C)
+WATCHDOG_VALUE = 76  # test 13: a low speed (30%) so a board takeover is obvious
+WATCHDOG_SECONDS = 30  # test 13: how long to watch each part
+WATCHDOG_IDLE_TEMP = 50.0  # test 13: wait for the CPU to cool to this first (C)
+RAMP_RPM = 800  # a fan rising this far above its lowest reading counts as a takeover
 
 # Copy of the fan curves in src/fan.rs: (temperature, duty), both in hundredths
 # (4500 = 45.00 C, 3000 = 30.00%). Keep in sync with FanCurve::standard() etc.
@@ -648,6 +652,113 @@ class Runner:
                      f"{celsius(reacted_temp)} (pwm1 {reacted_pwm}, peak {peak_rpm} RPM)")
         return None, f"{observed}; {board}. After restart: {curve_text}"
 
+    def label(self, text):
+        if self.sampler:
+            self.sampler.test = text
+
+    def watch_fans(self, rewrite_every=None):
+        """Set the fans to WATCHDOG_VALUE, then watch the RPM for WATCHDOG_SECONDS.
+        With rewrite_every, write the value again that often. Reports whether
+        the fans ramped up although nothing asked them to."""
+        write_all(self.hwmon, WATCHDOG_VALUE)
+        start = last_write = time.monotonic()
+        lowest = ramp_at = ramp_since_write = max_temp = None
+        peak = 0
+        while time.monotonic() - start < WATCHDOG_SECONDS:
+            now = time.monotonic()
+            if rewrite_every and now - last_write >= rewrite_every:
+                write_all(self.hwmon, WATCHDOG_VALUE)
+                last_write = now
+            fan = max((rpm(self.hwmon, i) or 0) for i in range(1, 5))
+            if lowest is None or fan < lowest:
+                # Still spinning down from before: only count the peak after this.
+                lowest = peak = fan
+            peak = max(peak, fan)
+            temp = daemon_temp()
+            if temp is not None:
+                max_temp = max(max_temp or 0, temp)
+            if ramp_at is None and fan > lowest + RAMP_RPM:
+                ramp_at, ramp_since_write = now - start, now - last_write
+            time.sleep(0.25)
+        return {"ramp_at": ramp_at, "since_write": ramp_since_write, "lowest": lowest,
+                "peak": peak, "max_temp": max_temp}
+
+    @staticmethod
+    def describe_watch(name, result):
+        temp = f"CPU <= {result['max_temp'] / 1000:.0f} C" if result["max_temp"] else "CPU ? C"
+        if result["ramp_at"] is None:
+            return (f"{name}: fans stayed low for {WATCHDOG_SECONDS} s "
+                    f"(settled at {result['lowest']}-{result['peak']} RPM, {temp})")
+        return (f"{name}: board ramped the fans to {result['peak']} RPM "
+                f"{result['since_write']:.1f} s after the last write ({temp})")
+
+    def test_watchdog(self):
+        """Is test 12's takeover a watchdog (host stopped writing) or temperature?
+
+        Informational, like test 12. Three parts, all with the CPU idle:
+          a. system76-power stopped, fans set to WATCHDOG_VALUE once
+          b. system76-power running but claimed, fans set once
+          c. claimed, fans rewritten every second, like system76-power does
+        FAIL only if system76-power doesn't come back and follow its curve."""
+        self.label("13 cooling down")
+        cooled = wait_for(lambda: (daemon_temp() or 0) < WATCHDOG_IDLE_TEMP * 1000, 120, step=1)
+        start_temp = daemon_temp()
+
+        self.label("13a system76-power stopped, fans set once")
+        stop = run(["systemctl", "stop", SERVICE], timeout=60)
+        if stop.returncode != 0 or service_active():
+            return False, f"could not stop system76-power: {stop.stderr.strip()}"
+        try:
+            part_a = self.watch_fans()
+        finally:
+            run(["systemctl", "start", SERVICE], timeout=60)
+        if wait_for(daemon_has_methods, 20, step=0.5) is None:
+            return False, "system76-power did not come back after part a"
+        time.sleep(3)  # let the curve settle the fans again
+
+        self.holder_conn = client.connect()
+        error = client.call(self.holder_conn, "ClaimFanControl")
+        if error:
+            return False, f"claim for parts b and c rejected: {error}"
+        try:
+            self.label("13b claimed, fans set once")
+            part_b = self.watch_fans()
+            self.label("13c claimed, fans rewritten every 1 s")
+            part_c = self.watch_fans(rewrite_every=1.0)
+        finally:
+            client.call(self.holder_conn, "ReleaseFanControl")
+            self.holder_conn.close_sync(None)
+            self.holder_conn = None
+        self.label("13 back on the curve")
+        curve_ok, curve_text = self.on_curve()
+        if not curve_ok:
+            return False, f"after the test {curve_text}"
+
+        once = [part_a, part_b]
+        hottest = max((r["max_temp"] or 0) for r in once + [part_c]) / 1000
+        idle = hottest < WATCHDOG_IDLE_TEMP + 10
+        idle_note = ("" if cooled is not None else
+                     f" Note: the CPU only cooled to {start_temp / 1000:.0f} C, not {WATCHDOG_IDLE_TEMP:.0f} C.")
+        cpu = (f"with the CPU idle (<= {hottest:.0f} C)" if idle else
+               f"but the CPU reached {hottest:.0f} C, so temperature can't be ruled out")
+        if all(r["ramp_at"] is not None for r in once) and part_c["ramp_at"] is None:
+            delay = max(r["since_write"] for r in once)
+            verdict = (f"VERDICT: the board has a watchdog. If nothing writes the fans for about "
+                       f"{delay:.0f} s it takes over and ramps them up, {cpu}. "
+                       "Rewriting every 1 s kept it from taking over, so a claimant must keep "
+                       "writing the fans regularly (system76-power writes every 1 s).")
+        elif all(r["ramp_at"] is None for r in once + [part_c]):
+            verdict = (f"VERDICT: no watchdog: the board left the fans alone {cpu}"
+                       + (", so test 12's takeover was triggered by temperature." if idle else "."))
+        else:
+            verdict = "VERDICT: mixed results; see the three parts and samples.csv."
+        parts = "; ".join([
+            self.describe_watch("a (system76-power stopped, set once)", part_a),
+            self.describe_watch("b (claimed, set once)", part_b),
+            self.describe_watch("c (claimed, rewritten every 1 s)", part_c),
+        ])
+        return None, f"{parts}. {verdict}{idle_note} After release: {curve_text}"
+
     def cleanup(self):
         for proc in self.procs:
             if proc.poll() is None:
@@ -710,6 +821,8 @@ def main():
                         help="skip test 11, which stops and restarts system76-power")
     parser.add_argument("--skip-firmware-check", action="store_true",
                         help="skip test 12, which stops system76-power and loads the CPU with the fans at 0")
+    parser.add_argument("--skip-watchdog-check", action="store_true",
+                        help="skip test 13, which checks whether the fan board takes over when not written to")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -769,9 +882,11 @@ def main():
         ("Non-root user is refused", runner.test_non_root),
         ("Daemon stop/restart while claimed", runner.test_restart),
         ("Fan board on its own with system76-power stopped (info)", runner.test_firmware_fallback),
+        ("Fan board watchdog: what triggers the takeover (info)", runner.test_watchdog),
     ]
     skips = {11: "--skip-restart" if args.skip_restart else None,
-             12: "--skip-firmware-check" if args.skip_firmware_check else None}
+             12: "--skip-firmware-check" if args.skip_firmware_check else None,
+             13: "--skip-watchdog-check" if args.skip_watchdog_check else None}
 
     passed = failed = 0
     try:
